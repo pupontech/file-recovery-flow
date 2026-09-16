@@ -1,0 +1,16 @@
+{
+  "SchemaVersion": 1,
+  "WorkflowVersion": "1.0.0",
+  "FileScavengerPath": null,
+  "RStudioPath": null,
+  "ValidatedFileScavengerBuilds": [],
+  "ValidatedRStudioBuilds": [],
+  "DestinationRoot": null,
+  "CapacityReserveBytes": 1073741824,
+  "MaxJobPathLength": 200,
+  "ClientName": null,
+  "NoPause": false,
+  "AllowSameDiskOverride": false,
+  "AllowVendorOverwrite": false,
+  "AllowForceClose": false
+}
