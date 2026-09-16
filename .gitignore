@@ -1,0 +1,20 @@
+# Test and local artifacts
+.test-results/
+artifacts/
+coverage/
+
+# Local operator configuration and case data
+config.local.json
+*.local.json
+logs/
+recovery-jobs/
+
+# PowerShell/editor files
+*.user
+*.suo
+.vscode/
+.idea/
+
+# GitHub/OS noise
+.DS_Store
+Thumbs.db
