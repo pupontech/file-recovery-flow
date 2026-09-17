@@ -59,6 +59,10 @@ Describe 'Front door forwards the documented technician arguments' {
             }
         }
 
+        function Get-EntryPointSourceText {
+            return [System.IO.File]::ReadAllText($script:EntryPoint)
+        }
+
         function ConvertFrom-ParentRegressionMarker {
             param([string]$Text)
             $start = $Text.IndexOf('###JSON###')
@@ -106,6 +110,13 @@ $line = Get-RecoveryAutomationElevationArgumentLine -ScriptPath 'C:\case\Recover
         $result.Line | Should -Match 'Front Door Client'
         $result.Line | Should -Match '-NoPause'
         $result.Line | Should -Match '-ConfigPath'
+    }
+
+    It 'never points the vendor log switch at the JSONL case event log' {
+        $source = Get-EntryPointSourceText
+        $source | Should -Match 'rstudio-host\.log'
+        # The handoff must not hand the case event log to a vendor switch.
+        ([regex]::Matches($source, '-LogPath \$Case\.LogPath')).Count | Should -Be 0
     }
 
     It 'relaunches UAC elevation with the running PowerShell host through the host resolver' {

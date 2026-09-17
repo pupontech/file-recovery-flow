@@ -2241,14 +2241,33 @@ function Invoke-RecoveryAutomationWorkflow {
             SourceProtection = $fresh.Protection
         }
     }.GetNewClosure()
+    # The vendor log is a dedicated file inside the case folder.
+    #
+    # R-Studio documents -log <filename> as 'writes the R-Studio log into the
+    # specified file', and the case event log is an append-only JSONL record with
+    # one JSON object per event. Pointing the vendor switch at events.jsonl mixed
+    # vendor text into the case record: the next validation would read it as
+    # malformed JSONL, and the one-writer-per-file contract was broken while the
+    # case was live. The vendor log therefore gets its own file, and the validator
+    # allows exactly that file and nothing else.
+    $vendorLogPath = [System.IO.Path]::Combine([string]$Case.JobFolderPath, 'rstudio-host.log')
     $logValidator = {
         param($path)
-        if ([string]::Equals([string]$path, [string]$Case.LogPath, [StringComparison]::OrdinalIgnoreCase) -and [System.IO.File]::Exists([string]$path)) {
-            return [pscustomobject]@{ Allowed = $true; Evidence = 'The handoff log path is the existing case log path.' }
+        if ([string]::IsNullOrWhiteSpace([string]$path)) {
+            return [pscustomobject]@{ Allowed = $false; ReasonCode = 'LogPathUnsafe'; Evidence = 'No vendor log path was supplied.' }
         }
-        return [pscustomobject]@{ Allowed = $false; ReasonCode = 'LogPathUnsafe'; Evidence = 'The handoff log path does not match the case log.' }
+        if (-not [string]::Equals([string]$path, $vendorLogPath, [StringComparison]::OrdinalIgnoreCase)) {
+            return [pscustomobject]@{ Allowed = $false; ReasonCode = 'LogPathUnsafe'; Evidence = 'The vendor log must be the dedicated R-Studio log file inside the case folder.' }
+        }
+        if ([string]::Equals($vendorLogPath, [string]$Case.LogPath, [StringComparison]::OrdinalIgnoreCase)) {
+            return [pscustomobject]@{ Allowed = $false; ReasonCode = 'LogPathUnsafe'; Evidence = 'The vendor log must never be the JSONL case event log.' }
+        }
+        if (-not [System.IO.Directory]::Exists([string]$Case.JobFolderPath)) {
+            return [pscustomobject]@{ Allowed = $false; ReasonCode = 'LogPathUnsafe'; Evidence = 'The case folder for the vendor log does not exist.' }
+        }
+        return [pscustomobject]@{ Allowed = $true; Evidence = 'The vendor log path is the dedicated R-Studio log file inside the case folder.' }
     }.GetNewClosure()
-    $handoffResult = Invoke-RecoveryAutomationHandoff -State $State -Executable $RStudioExecutable -LogPath $Case.LogPath `
+    $handoffResult = Invoke-RecoveryAutomationHandoff -State $State -Executable $RStudioExecutable -LogPath $vendorLogPath `
         -ProcessRunner $RStudioProcessRunner -LogPathSafetyValidator $logValidator -FreshEvidenceProvider $freshEvidence `
         -ActivationProvider $RStudioActivationProvider -EventWriter $EventWriter -StateWriter $StateWriter -Clock $Clock
     if (-not $handoffResult.Allowed) {
