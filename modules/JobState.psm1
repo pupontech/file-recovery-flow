@@ -498,6 +498,32 @@ function Invoke-RecoveryStateProviderCall {
     return [pscustomobject]@{ Success = $true; Data = $data; ReasonCode = $null; Message = $null }
 }
 
+function Get-RecoveryStateUtcNow {
+    # Single clock seam for lease decisions. A missing or unusable clock is
+    # refused by the caller rather than silently replaced with wall-clock time,
+    # except when no clock was supplied at all.
+    param([object]$Clock = $null)
+    if ($null -eq $Clock) { return [datetime]::UtcNow }
+    $value = $null
+    if ($Clock -is [scriptblock]) {
+        try { $value = & $Clock @{ Operation = 'NowUtc' } } catch { $value = $null }
+    }
+    else {
+        $property = $Clock.PSObject.Properties['NowUtc']
+        if ($null -ne $property) {
+            $candidate = $property.Value
+            if ($candidate -is [scriptblock]) {
+                try { $value = & $candidate @{ Operation = 'NowUtc' } } catch { $value = $null }
+            }
+            else { $value = $candidate }
+        }
+    }
+    if ($null -eq $value) { return [datetime]::UtcNow }
+    $instant = [datetime]$value
+    if ($instant.Kind -eq [System.DateTimeKind]::Local) { return $instant.ToUniversalTime() }
+    return $instant
+}
+
 function Get-RecoveryStateBindingCheck {
     # Binds a resume read or decision to its lock, claim marker, and log history:
     # the lock file must belong to this job folder and record the same job and
@@ -507,7 +533,9 @@ function Get-RecoveryStateBindingCheck {
         [object]$State,
         [object]$Lock = $null,
         [bool]$RequireLock = $false,
-        [switch]$LockOnly
+        [switch]$LockOnly,
+        [object]$Clock = $null,
+        [string]$ExpectedOwner = ''
     )
     $result = [pscustomobject]@{ IsBound = $false; ReasonCode = $null; Message = $null; LastEvent = $null; LastSequence = 0; LockPath = $null; ClaimPath = $null }
     if ($null -eq $State) {
@@ -633,6 +661,46 @@ function Get-RecoveryStateBindingCheck {
             $result.Message = 'The lock claim does not match the job folder claim marker.'
             return $result
         }
+        # A recorded lease is only meaningful when it is compared with the clock.
+        # Without this the durable lock outlives its own expiry and an expired
+        # worker can still read resume state.
+        $leaseInstant = [datetime]::Parse([string]$lockLease, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+        $nowInstant = Get-RecoveryStateUtcNow -Clock $Clock
+        if ($nowInstant -ge $leaseInstant) {
+            $result.ReasonCode = 'LockLeaseExpired'
+            $result.Message = 'The job lock lease has expired, so this read is refused until the lock is reacquired.'
+            return $result
+        }
+        # The durable owner is a capability, not a description: the caller must
+        # present the same owner the lock file records (and the expected owner
+        # when the caller knows it), so a forged or stale lock object cannot
+        # authorize a resume read.
+        $suppliedOwner = [string](Get-RecoveryStateMemberValue -Object $Lock -Name 'Owner')
+        if ($suppliedOwner.Trim().Length -eq 0 -or -not $suppliedOwner.Trim().Equals($lockOwner.Trim(), [System.StringComparison]::Ordinal)) {
+            $result.ReasonCode = 'LockOwnerMismatch'
+            $result.Message = 'The presented lock owner does not match the durable lock owner.'
+            return $result
+        }
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedOwner)) {
+            if (-not $ExpectedOwner.Trim().Equals($lockOwner.Trim(), [System.StringComparison]::Ordinal)) {
+                $result.ReasonCode = 'LockOwnerMismatch'
+                $result.Message = 'The durable lock is owned by another worker.'
+                return $result
+            }
+        }
+        # The lock must state the job it was acquired for. An empty job id used
+        # to be accepted as a wildcard, which let a lock from one case bind to
+        # the state of another.
+        if ($lockJobId.Trim().Length -eq 0) {
+            $result.ReasonCode = 'LockNotBound'
+            $result.Message = 'The lock does not record the job id it was acquired for.'
+            return $result
+        }
+        if ($jobId.Trim().Length -gt 0 -and -not $lockJobId.Trim().Equals($jobId.Trim(), [System.StringComparison]::Ordinal)) {
+            $result.ReasonCode = 'LockNotBound'
+            $result.Message = 'The lock belongs to a different job id.'
+            return $result
+        }
     }
     if (-not $LockOnly -and $jobId.Trim().Length -eq 0) {
         $result.ReasonCode = 'StateInvalid'
@@ -736,7 +804,9 @@ function Read-RecoveryJobState {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][AllowEmptyString()][object]$Path,
-        [object]$Lock = $null
+        [object]$Lock = $null,
+        [object]$Clock = $null,
+        [string]$ExpectedOwner = ''
     )
     $result = [pscustomobject]@{ Success = $false; State = $null; ReasonCode = $null; Errors = @(); Message = $null; Binding = $null }
     if ($null -eq $Path) { $result.ReasonCode = 'StateMissing'; return $result }
@@ -750,7 +820,7 @@ function Read-RecoveryJobState {
         LastEventSequence = 0
         Paths             = [pscustomobject]@{ JobFolderPath = (Get-RecoveryStateParentText -Path $pathText); LogPath = '' }
     }
-    $binding = Get-RecoveryStateBindingCheck -State $preliminary -Lock $Lock -RequireLock $true -LockOnly
+    $binding = Get-RecoveryStateBindingCheck -State $preliminary -Lock $Lock -RequireLock $true -LockOnly -Clock $Clock -ExpectedOwner $ExpectedOwner
     if (-not $binding.IsBound) {
         $result.ReasonCode = $binding.ReasonCode
         $result.Message = $binding.Message
@@ -782,7 +852,7 @@ function Read-RecoveryJobState {
         $result.Message = (@($shape.Errors) -join ' ')
         return $result
     }
-    $binding = Get-RecoveryStateBindingCheck -State $state -Lock $Lock -RequireLock $true
+    $binding = Get-RecoveryStateBindingCheck -State $state -Lock $Lock -RequireLock $true -Clock $Clock -ExpectedOwner $ExpectedOwner
     $result.Binding = $binding
     if (-not $binding.IsBound) {
         $result.ReasonCode = $binding.ReasonCode

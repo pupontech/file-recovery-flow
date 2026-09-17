@@ -2730,8 +2730,22 @@ function Invoke-RecoveryAutomation {
                 -Runtime $runtime -Applications $applications -SourceIdentity $sourceIdentity `
                 -DestinationIdentity $destinationIdentity -Capacity $capacity
         }
+        # The destination root was proven separate above, but the case folder that
+        # is about to be generated is a different path and is proven separately
+        # before the folder or its claim marker can exist. Getting this wrong is how
+        # a claim marker used to appear on media that was never proven separate.
+        $diskProviderForClaimCheck = $DiskProvider
+        $sourceForClaimCheck = $sourceIdentity
+        $preclaimSafetyCheck = {
+            param($request)
+            $candidateIdentity = DiskDetection\Resolve-RecoveryPathIdentity -Path ([string]$request.Path) -Provider $diskProviderForClaimCheck
+            $candidateSeparation = DiskDetection\Test-DestinationSafety -SourceIdentity $sourceForClaimCheck `
+                -DestinationPath ([string]$request.Path) -Provider $diskProviderForClaimCheck -DestinationIdentity $candidateIdentity
+            return [pscustomobject]@{ Allowed = [bool]$candidateSeparation.Allowed; ReasonCode = $candidateSeparation.ReasonCode }
+        }.GetNewClosure()
         $folderResult = DiskDetection\New-RecoveryJobFolder -RootPath ([string]$destinationText) `
             -ClientName $effectiveClientName -Clock $Clock -ClaimProvider $ClaimProvider `
+            -PreclaimSafetyCheck $preclaimSafetyCheck `
             -MaxPathLength ([int]$configurationResult.Configuration.MaxJobPathLength)
         $case = [pscustomobject]@{ JobFolderPath = $folderResult.JobFolderPath; ClaimPath = $folderResult.ClaimPath; StatePath = $null; LogPath = $null; MetadataPath = $null; FolderResult = $folderResult }
         if (-not $folderResult.Created) {

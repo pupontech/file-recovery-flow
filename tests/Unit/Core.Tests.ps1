@@ -1581,7 +1581,7 @@ Describe 'Job state schema, round trip, and ownership (C-18, C-19)' {
         $lock = Lock-RecoveryJob -JobPath $fixture.Folder -Clock (New-FixedClock) -JobId $fixture.JobId
 
         $written = Write-RecoveryJobState -Path $fixture.Paths.StatePath -State $fixture.State
-        $read = Read-RecoveryJobState -Path $fixture.Paths.StatePath -Lock $lock
+        $read = Read-RecoveryJobState -Path $fixture.Paths.StatePath -Lock $lock -Clock (New-FixedClock -UtcInstant $script:Now)
 
         $lock.Acquired | Should -BeTrue
         $written.Success | Should -BeTrue
@@ -1609,9 +1609,12 @@ Describe 'Job state schema, round trip, and ownership (C-18, C-19)' {
         $fixture = New-StateFixture -FolderName 'job-state-f'
         Write-RecoveryJobState -Path $fixture.Paths.StatePath -State $fixture.State | Out-Null
 
-        $noLock = Read-RecoveryJobState -Path $fixture.Paths.StatePath -Lock $null
-        $heldLock = Read-RecoveryJobState -Path $fixture.Paths.StatePath -Lock ([pscustomobject]@{ Acquired = $false })
-        $unboundLock = Read-RecoveryJobState -Path $fixture.Paths.StatePath -Lock ([pscustomobject]@{ Acquired = $true })
+        # Every read here is evaluated against the fixture clock, so a refusal is
+        # always the binding or lease decision under test and never the host clock.
+        $readClock = New-FixedClock -UtcInstant $script:Now
+        $noLock = Read-RecoveryJobState -Path $fixture.Paths.StatePath -Lock $null -Clock $readClock
+        $heldLock = Read-RecoveryJobState -Path $fixture.Paths.StatePath -Lock ([pscustomobject]@{ Acquired = $false }) -Clock $readClock
+        $unboundLock = Read-RecoveryJobState -Path $fixture.Paths.StatePath -Lock ([pscustomobject]@{ Acquired = $true }) -Clock $readClock
 
         $noLock.Success | Should -BeFalse
         $noLock.ReasonCode | Should -Be 'LockRequired'
@@ -1631,10 +1634,10 @@ Describe 'Job state schema, round trip, and ownership (C-18, C-19)' {
         $incompletePath = Join-Path -Path $fixture.Folder -ChildPath 'incomplete-state.json'
         [System.IO.File]::WriteAllText($incompletePath, '{"SchemaVersion":1,"JobId":"JOB-1"}', [System.Text.UTF8Encoding]::new($false))
 
-        $malformed = Read-RecoveryJobState -Path $malformedPath -Lock $lock
-        $schema = Read-RecoveryJobState -Path $schemaPath -Lock $lock
-        $incomplete = Read-RecoveryJobState -Path $incompletePath -Lock $lock
-        $missing = Read-RecoveryJobState -Path (Join-Path -Path $fixture.Folder -ChildPath 'absent.json') -Lock $lock
+        $malformed = Read-RecoveryJobState -Path $malformedPath -Lock $lock -Clock (New-FixedClock -UtcInstant $script:Now)
+        $schema = Read-RecoveryJobState -Path $schemaPath -Lock $lock -Clock (New-FixedClock -UtcInstant $script:Now)
+        $incomplete = Read-RecoveryJobState -Path $incompletePath -Lock $lock -Clock (New-FixedClock -UtcInstant $script:Now)
+        $missing = Read-RecoveryJobState -Path (Join-Path -Path $fixture.Folder -ChildPath 'absent.json') -Lock $lock -Clock (New-FixedClock -UtcInstant $script:Now)
 
         $malformed.Success | Should -BeFalse
         $malformed.ReasonCode | Should -Be 'StateMalformed'
@@ -1723,7 +1726,7 @@ Describe 'Job state schema, round trip, and ownership (C-18, C-19)' {
         Write-RecoveryJobState -Path $fixture.Paths.StatePath -State $fixture.State | Out-Null
 
         $result = Set-RecoveryState -State $fixture.State -To 'PREFLIGHT_PENDING' -EventWriter $eventWriter -Clock (New-FixedClock)
-        $read = Read-RecoveryJobState -Path $fixture.Paths.StatePath -Lock $lock
+        $read = Read-RecoveryJobState -Path $fixture.Paths.StatePath -Lock $lock -Clock (New-FixedClock -UtcInstant $script:Now)
         $logCheck = Test-RecoveryLog -Path $fixture.Paths.LogPath -JobId $fixture.JobId
 
         $lock.Acquired | Should -BeTrue
@@ -1957,7 +1960,7 @@ Describe 'Resume binding and snapshot preservation (C-18, C-19, C-20)' {
     It 'reads a resume state whose lock, claim marker, and log all bind to it' {
         $case = New-BoundCase -FolderName 'job-bound-b'
 
-        $read = Read-RecoveryJobState -Path $case.Paths.StatePath -Lock $case.Lock
+        $read = Read-RecoveryJobState -Path $case.Paths.StatePath -Lock $case.Lock -Clock (New-FixedClock -UtcInstant $script:Now)
 
         $read.Success | Should -BeTrue
         $read.State.JobId | Should -Be $case.JobId
@@ -1970,7 +1973,7 @@ Describe 'Resume binding and snapshot preservation (C-18, C-19, C-20)' {
         $other = New-BoundCase -FolderName 'job-bound-c-other'
         $forged = [pscustomobject]@{ Acquired = $true; LockPath = $other.Lock.LockPath }
 
-        $read = Read-RecoveryJobState -Path $case.Paths.StatePath -Lock $forged
+        $read = Read-RecoveryJobState -Path $case.Paths.StatePath -Lock $forged -Clock (New-FixedClock -UtcInstant $script:Now)
 
         $read.Success | Should -BeFalse
         $read.ReasonCode | Should -Be 'LockNotBound'
@@ -1984,7 +1987,7 @@ Describe 'Resume binding and snapshot preservation (C-18, C-19, C-20)' {
         $content.ClaimId = 'DIFFERENT-CLAIM'
         [System.IO.File]::WriteAllText($lockPath, ($content | ConvertTo-Json -Depth 4 -Compress), (New-Object System.Text.UTF8Encoding($false)))
 
-        $read = Read-RecoveryJobState -Path $case.Paths.StatePath -Lock $case.Lock
+        $read = Read-RecoveryJobState -Path $case.Paths.StatePath -Lock $case.Lock -Clock (New-FixedClock -UtcInstant $script:Now)
 
         $read.Success | Should -BeFalse
         $read.ReasonCode | Should -Be 'ClaimNotBound'
@@ -2001,7 +2004,7 @@ Describe 'Resume binding and snapshot preservation (C-18, C-19, C-20)' {
             DestinationIdentity = (New-IdentitySnapshot -VolumeGuid 'VOLUME-GUID-DST' -IdentityKeys @('UID|WWN|FIXTURE-DST'))
         }
 
-        $read = Read-RecoveryJobState -Path $case.Paths.StatePath -Lock $case.Lock
+        $read = Read-RecoveryJobState -Path $case.Paths.StatePath -Lock $case.Lock -Clock (New-FixedClock -UtcInstant $script:Now)
 
         $advanced.Success | Should -BeTrue
         $advanced.Sequence | Should -Be 2
@@ -2016,7 +2019,7 @@ Describe 'Resume binding and snapshot preservation (C-18, C-19, C-20)' {
         $written.State = 'PREFLIGHT_PENDING'
         [System.IO.File]::WriteAllText($statePath, ($written | ConvertTo-Json -Depth 12), (New-Object System.Text.UTF8Encoding($false)))
 
-        $read = Read-RecoveryJobState -Path $statePath -Lock $case.Lock
+        $read = Read-RecoveryJobState -Path $statePath -Lock $case.Lock -Clock (New-FixedClock -UtcInstant $script:Now)
 
         $read.Success | Should -BeFalse
         $read.ReasonCode | Should -Be 'LogStateMismatch'

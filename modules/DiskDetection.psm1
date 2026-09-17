@@ -486,8 +486,19 @@ function Test-RecoveryMembershipIncomplete {
     param([object]$Record)
     $value = Get-RecoveryMemberValue -Object $Record -Name 'MembersIncomplete'
     if ($null -eq $value) { return $true }
-    if ($value -is [bool]) { return [bool]$value }
-    return $true
+    if ($value -isnot [bool]) { return $true }
+    if ([bool]$value) { return $true }
+    # A stated-complete record is still a subset when the topology says more
+    # members exist than were actually resolved: a spanned, striped, or Storage
+    # Spaces volume whose read returned only some of its disks must never be
+    # compared as if the remaining disks were known to be absent.
+    $declared = Get-RecoveryMemberValue -Object $Record -Name 'DeclaredMemberCount'
+    if ($null -eq $declared) { return $false }
+    $declaredCount = -1
+    if (-not [int]::TryParse([string]$declared, [ref]$declaredCount)) { return $true }
+    if ($declaredCount -lt 0) { return $true }
+    if ($declaredCount -gt (@(Get-RecoveryPhysicalDiskNumbers -Record $Record)).Count) { return $true }
+    return $false
 }
 
 function Test-RecoveryReparseResolved {
@@ -1004,6 +1015,28 @@ function Get-RecoveryDefaultClaimProvider {
     return $provider
 }
 
+function Invoke-RecoveryPreclaimSafety {
+    param([scriptblock]$Check, [string]$Path, [string]$RootPath, [string]$Stage)
+    # Optional for standalone folder callers; the production orchestrator supplies
+    # this gate. Only one explicit Boolean approval can authorize each write.
+    if ($null -eq $Check) { return [pscustomobject]@{ Allowed = $true; ReasonCode = $null; Message = $null } }
+    try {
+        $checks = @(& $Check ([pscustomobject]@{ Path = $Path; RootPath = $RootPath; Stage = $Stage }))
+    }
+    catch { return [pscustomobject]@{ Allowed = $false; ReasonCode = 'PreclaimSafetyUnproven'; Message = $_.Exception.Message } }
+    $allowed = $null
+    if ($checks.Count -eq 1) { $allowed = Get-RecoveryMemberValue -Object $checks[0] -Name 'Allowed' }
+    if ($allowed -is [bool] -and $allowed) {
+        return [pscustomobject]@{ Allowed = $true; ReasonCode = $null; Message = $null }
+    }
+    $reasonCode = 'PreclaimSafetyUnproven'
+    if ($checks.Count -eq 1 -and $allowed -is [bool]) {
+        $reason = Get-RecoveryMemberValue -Object $checks[0] -Name 'ReasonCode'
+        if (-not [string]::IsNullOrWhiteSpace([string]$reason)) { $reasonCode = [string]$reason }
+    }
+    return [pscustomobject]@{ Allowed = $false; ReasonCode = $reasonCode; Message = 'Fresh destination proof was refused before a case write.' }
+}
+
 function New-RecoveryJobFolder {
     [CmdletBinding()]
     param(
@@ -1013,7 +1046,8 @@ function New-RecoveryJobFolder {
         [object]$ClaimProvider = $null,
         [int]$MaxPathLength = 200,
         [int]$MaxSuffix = 99,
-        [string]$ClaimFileName = 'job-claim.json'
+        [string]$ClaimFileName = 'job-claim.json',
+        [scriptblock]$PreclaimSafetyCheck = $null
     )
     $result = [pscustomobject]@{
         Created        = $false
@@ -1065,6 +1099,12 @@ function New-RecoveryJobFolder {
             $index = $index + 1
             continue
         }
+        $preclaim = Invoke-RecoveryPreclaimSafety -Check $PreclaimSafetyCheck -Path $folderPath -RootPath $rootText -Stage 'BeforeDirectoryCreate'
+        if (-not $preclaim.Allowed) {
+            $result.ReasonCode = $preclaim.ReasonCode
+            $result.Message = $preclaim.Message
+            return $result
+        }
         try {
             [void][System.IO.Directory]::CreateDirectory($folderPath)
         }
@@ -1078,6 +1118,12 @@ function New-RecoveryJobFolder {
         if (@([System.IO.Directory]::GetFileSystemEntries($folderPath)).Count -gt 0) {
             $index = $index + 1
             continue
+        }
+        $preclaim = Invoke-RecoveryPreclaimSafety -Check $PreclaimSafetyCheck -Path $folderPath -RootPath $rootText -Stage 'BeforeClaimWrite'
+        if (-not $preclaim.Allowed) {
+            $result.ReasonCode = $preclaim.ReasonCode
+            $result.Message = $preclaim.Message
+            return $result
         }
         $claimPath = Join-Path -Path $folderPath -ChildPath $ClaimFileName
         $createdUtc = Format-RecoveryUtcTimestamp -Clock $Clock

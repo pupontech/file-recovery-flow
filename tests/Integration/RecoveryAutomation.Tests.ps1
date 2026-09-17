@@ -269,6 +269,115 @@ Describe 'RecoveryAutomation bounded entrypoint' {
         $protectionCalls.Count | Should -BeGreaterThan 1
     }
 
+    It 'refuses a job folder whose own path is not proven separate from the source disk' {
+        $sourcePath = Join-Path -Path $TestDrive -ChildPath 'source-preclaim'
+        $destinationPath = Join-Path -Path $TestDrive -ChildPath 'destination-preclaim'
+        # The generated case folder name is timestamped, so the denial is expressed
+        # against the destination tree the folder would be created in: the provider
+        # reports every path under it as belonging to the source volume.
+        New-Item -ItemType Directory -Path $sourcePath -Force | Out-Null
+        New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null
+        $filePath = Join-Path -Path $TestDrive -ChildPath 'file-scavenger-preclaim.bin'
+        $rStudioPath = Join-Path -Path $TestDrive -ChildPath 'r-studio-preclaim.bin'
+        Set-Content -LiteralPath $filePath -Value 'fixture' -Encoding ASCII
+        Set-Content -LiteralPath $rStudioPath -Value 'fixture' -Encoding ASCII
+
+        $disks = @(
+            [pscustomobject]@{ DiskNumber = 4; UniqueId = 'SOURCE-DISK-CLAIM'; UniqueIdFormat = 'WWN'; SerialNumber = 'SOURCE-SERIAL-CLAIM'; Model = 'Source'; SizeBytes = 1000000 }
+            [pscustomobject]@{ DiskNumber = 5; UniqueId = 'DESTINATION-DISK-CLAIM'; UniqueIdFormat = 'WWN'; SerialNumber = 'DESTINATION-SERIAL-CLAIM'; Model = 'Destination'; SizeBytes = 2000000 }
+        )
+        # The destination root is reported on disk 5 so the first separation check
+        # passes, while every path inside it (including the case folder this run
+        # would generate) resolves to the source volume. That is the topology the
+        # pre-write proof has to refuse before any case byte exists.
+        $diskProvider = @{
+            Name = 'IntegrationFixturePreclaim'
+            GetDisks = {
+                param($request)
+                foreach ($disk in $disks) {
+                    if ([int]$disk.DiskNumber -eq [int]$request.DiskNumber) { return $disk }
+                }
+                return $null
+            }.GetNewClosure()
+            ResolvePath = {
+                param($request)
+                $path = [string]$request.Path
+                $isSource = ($path -eq [string]$sourcePath)
+                $onSourceVolume = $isSource -or $path.StartsWith([string]$destinationPath, [System.StringComparison]::OrdinalIgnoreCase)
+                return [pscustomobject]@{
+                    CanonicalPath = $path
+                    Exists = $true
+                    IsContainer = $true
+                    ReparseResolved = $true
+                    IsReparsePoint = $false
+                    MembersIncomplete = $false
+                    DiskNumber = if ($onSourceVolume) { 4 } else { 5 }
+                    PartitionNumber = 1
+                    VolumeGuid = if ($onSourceVolume) { 'SOURCE-VOLUME-CLAIM' } else { 'DESTINATION-VOLUME-CLAIM' }
+                    VolumePath = if ($onSourceVolume) { 'SOURCE-VOLUME-PATH-CLAIM' } else { 'DESTINATION-VOLUME-PATH-CLAIM' }
+                    DriveLetter = $null
+                }
+            }.GetNewClosure()
+            GetFreeSpace = {
+                param($request)
+                return [pscustomobject]@{ VolumeAvailableBytes = 1000000000; UserAvailableBytes = 1000000000 }
+            }.GetNewClosure()
+        }
+        $candidateProvider = {
+            param($product, $explicitPath)
+            if ($product -eq 'FileScavenger') {
+                return [pscustomobject]@{
+                    Path = $explicitPath
+                    Exists = $true
+                    Readable = $true
+                    FileVersion = '7.1.1.13'
+                    ProductVersion = '7.1.1.13'
+                    ProductName = 'File Scavenger'
+                    OriginalFilename = 'file-scavenger-preclaim.bin'
+                    EvidenceSource = 'IntegrationFixture'
+                }
+            }
+            return [pscustomobject]@{
+                Path = $explicitPath
+                Exists = $true
+                Readable = $true
+                FileVersion = '9.5.191810'
+                ProductVersion = '9.5.191810'
+                ProductName = 'R-Studio'
+                OriginalFilename = 'r-studio-preclaim.bin'
+                CompanyName = 'R-Tools Technology Inc.'
+                OwnerValidated = $true
+                OwnerEvidence = 'IntegrationFixture'
+                EvidenceSource = 'FileVersionInfo: IntegrationFixture'
+            }
+        }.GetNewClosure()
+        $launches = New-Object System.Collections.Generic.List[string]
+        $fileRunner = {
+            param($path)
+            $launches.Add([string]$path) | Out-Null
+            return [pscustomobject]@{ Path = $path; Pid = 4811; StartTime = '2026-01-01T00:00:00Z' }
+        }.GetNewClosure()
+        $sourceProtection = { param($request) return $true }
+
+        $result = Invoke-RecoveryAutomation -ConfigPath $script:ConfigPath -NoPause `
+            -SourcePath $sourcePath -DestinationPath $destinationPath `
+            -ConfigurationOverrides @{ FileScavengerPath = $filePath; RStudioPath = $rStudioPath; ClientName = 'Client Preclaim' } `
+            -SourceProtectionProvider $sourceProtection -DiskProvider $diskProvider `
+            -FileScavengerDiscoveryProvider $candidateProvider -RStudioDiscoveryProvider $candidateProvider `
+            -ValidatedFileScavengerBuilds @('7.1.1.13') -ValidatedRStudioBuilds @('9.5.191810') `
+            -RuntimeProvider { return @{ Compatible = $true; Evidence = 'IntegrationFixture' } } `
+            -ElevationProvider { return $true } -FileScavengerProcessRunner $fileRunner
+
+        $result.Success | Should -BeFalse
+        # The refused candidate is on the source volume itself, which is the
+        # strongest form of the same-disk refusal.
+        $result.ReasonCode | Should -Be 'SameVolume'
+        $result.ExitCode | Should -Be 5
+        $result.VendorLaunchAttempted | Should -BeFalse
+        $launches | Should -HaveCount 0
+        @([System.IO.Directory]::GetFileSystemEntries($destinationPath)).Count | Should -Be 0
+    }
+
     It 'fails closed when the post-launch G-04 gate snapshot cannot be written' {
         $sourcePath = Join-Path -Path $TestDrive -ChildPath 'source-gate-write'
         $destinationPath = Join-Path -Path $TestDrive -ChildPath 'destination-gate-write'
