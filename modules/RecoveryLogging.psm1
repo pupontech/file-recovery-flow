@@ -521,7 +521,26 @@ function Test-RecoveryLog {
             break
         }
         $sequence = Get-RecoveryLogMemberValue -Object $record -Name 'Sequence'
-        if ($null -eq $sequence -or [int]$sequence -ne $expected) {
+        # A sequence the record cannot state as a number is a malformed record, not
+        # an exception: casting 'not-a-number' threw out of the validator and the
+        # caller reported an unhandled workflow error instead of the named refusal.
+        $sequenceNumber = -1
+        $sequenceParsed = $false
+        if ($null -ne $sequence -and -not ($sequence -is [bool])) {
+            if ($sequence -is [string]) {
+                $sequenceParsed = [int]::TryParse(([string]$sequence).Trim(), [ref]$sequenceNumber)
+            }
+            else {
+                try {
+                    $sequenceNumber = [int]$sequence
+                    $sequenceParsed = $true
+                }
+                catch {
+                    $sequenceParsed = $false
+                }
+            }
+        }
+        if (-not $sequenceParsed -or $sequenceNumber -ne $expected) {
             $errors.Add(("Line {0} has sequence '{1}' instead of '{2}'." -f ($index + 1), $sequence, $expected)) | Out-Null
             $result.ReasonCode = 'LogSequenceInvalid'
             break

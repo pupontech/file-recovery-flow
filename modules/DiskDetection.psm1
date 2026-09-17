@@ -818,8 +818,28 @@ function Get-RecoveryDestinationSpace {
     $candidates = New-Object System.Collections.Generic.List[long]
     $volumeValue = Get-RecoveryMemberValue -Object $record -Name 'VolumeAvailableBytes'
     $userValue = Get-RecoveryMemberValue -Object $record -Name 'UserAvailableBytes'
-    if ($null -ne $volumeValue -and [long]$volumeValue -ge 0) { $candidates.Add([long]$volumeValue) | Out-Null }
-    if ($null -ne $userValue -and [long]$userValue -ge 0) { $candidates.Add([long]$userValue) | Out-Null }
+    # A reading the provider cannot state as a size is unknown capacity, not an
+    # exception: casting 'n/a' threw and the entry point reported the whole run as
+    # an unhandled workflow error instead of the documented capacity refusal.
+    foreach ($value in @($volumeValue, $userValue)) {
+        if ($null -eq $value) { continue }
+        $parsedBytes = [long]0
+        $parsed = $false
+        if ($value -is [bool]) { continue }
+        if ($value -is [string]) {
+            $parsed = [long]::TryParse(([string]$value).Trim(), [ref]$parsedBytes)
+        }
+        else {
+            try {
+                $parsedBytes = [long]$value
+                $parsed = $true
+            }
+            catch {
+                $parsed = $false
+            }
+        }
+        if ($parsed -and $parsedBytes -ge 0) { $candidates.Add($parsedBytes) | Out-Null }
+    }
     if ($candidates.Count -eq 0) {
         $result.IsUnknown = $true
         $result.IsSufficient = $false

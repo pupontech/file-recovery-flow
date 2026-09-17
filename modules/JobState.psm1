@@ -212,7 +212,17 @@ function Test-RecoveryJobStateShape {
         return [pscustomobject]@{ IsValid = $false; Errors = $errors.ToArray() }
     }
     $schemaVersion = Get-RecoveryStateMemberValue -Object $State -Name 'SchemaVersion'
-    if ($null -eq $schemaVersion -or [int]$schemaVersion -ne 1) {
+    # A schema version the state cannot state as the number 1 is an invalid state,
+    # not an exception: casting a non-numeric value threw out of the shape check.
+    $schemaNumber = -1
+    $schemaParsed = $false
+    if ($null -ne $schemaVersion -and -not ($schemaVersion -is [bool])) {
+        if ($schemaVersion -is [string]) { $schemaParsed = [int]::TryParse(([string]$schemaVersion).Trim(), [ref]$schemaNumber) }
+        else {
+            try { $schemaNumber = [int]$schemaVersion; $schemaParsed = $true } catch { $schemaParsed = $false }
+        }
+    }
+    if (-not $schemaParsed -or $schemaNumber -ne 1) {
         $errors.Add('SchemaVersion must be 1.') | Out-Null
     }
     $jobId = Get-RecoveryStateMemberValue -Object $State -Name 'JobId'
@@ -509,7 +519,22 @@ function Get-RecoveryStateBindingCheck {
     $jobFolderText = Get-RecoveryStateDirectoryText -Path $jobFolder
     $logPath = [string](Get-RecoveryStateMemberValue -Object $paths -Name 'LogPath')
     $jobId = [string](Get-RecoveryStateMemberValue -Object $State -Name 'JobId')
-    $expectedSequence = [int](Get-RecoveryStateMemberValue -Object $State -Name 'LastEventSequence')
+    # The durable sequence is read defensively: a state whose sequence cannot be
+    # stated as a number is invalid, not an exception inside the binding check.
+    $sequenceValue = Get-RecoveryStateMemberValue -Object $State -Name 'LastEventSequence'
+    $expectedSequence = -1
+    $sequenceParsed = $false
+    if ($null -ne $sequenceValue -and -not ($sequenceValue -is [bool])) {
+        if ($sequenceValue -is [string]) { $sequenceParsed = [int]::TryParse(([string]$sequenceValue).Trim(), [ref]$expectedSequence) }
+        else {
+            try { $expectedSequence = [int]$sequenceValue; $sequenceParsed = $true } catch { $sequenceParsed = $false }
+        }
+    }
+    if (-not $sequenceParsed) {
+        $result.ReasonCode = 'StateInvalid'
+        $result.Message = 'The state does not carry a durable event sequence.'
+        return $result
+    }
     if ($jobFolderText.Length -eq 0) {
         $result.ReasonCode = 'StateInvalid'
         $result.Message = 'The state does not identify its job folder.'

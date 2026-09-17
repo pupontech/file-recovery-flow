@@ -324,7 +324,8 @@ Describe 'Path guards refuse instead of throwing' {
             param([string]$Body)
             $moduleRoot = $script:ModulesRoot
             $scriptPath = [System.IO.Path]::Combine($PSScriptRoot, ('parent-guard-' + [guid]::NewGuid().ToString('N') + '.ps1'))
-            $prefix = 'Import-Module -Name "' + $moduleRoot + '\RStudio.psm1" -Force' + [char]10 +
+            $prefix = '$script:EntryPointPath = "' + $script:EntryPoint + '"' + [char]10 +
+                'Import-Module -Name "' + $moduleRoot + '\RStudio.psm1" -Force' + [char]10 +
                 'Import-Module -Name "' + $moduleRoot + '\TechnicianUi.psm1" -Force' + [char]10 +
                 'Import-Module -Name "' + $moduleRoot + '\ApplicationDiscovery.psm1" -Force' + [char]10
             [System.IO.File]::WriteAllText($scriptPath, ($prefix + $Body), (New-Object System.Text.UTF8Encoding($false)))
@@ -363,6 +364,48 @@ $accepted = New-RStudioArgumentList -LogPath 'C:\case\good name.log'
         $result.WildcardDecision | Should -Be 'Blocked'
         $result.ControlDecision | Should -Be 'Blocked'
         $result.AcceptedDecision | Should -Be 'Ready'
+    }
+
+    It 'turns an unparsable reading into a named refusal instead of a throw' {
+        $result = Invoke-ModuleGuardProbe -Body @'
+$modulesRoot = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($script:EntryPointPath), 'modules')
+Import-Module -Name ([System.IO.Path]::Combine($modulesRoot, 'DiskDetection.psm1')) -Force
+Import-Module -Name ([System.IO.Path]::Combine($modulesRoot, 'RecoveryLogging.psm1')) -Force
+$provider = @{
+    Name = 'Probe'
+    GetVolumes = { param($request) @() }
+    GetDisks = { param($request) @() }
+    ResolvePath = { param($request) [pscustomobject]@{ CanonicalPath = $request.Path; Exists = $true; IsContainer = $true } }
+    GetFreeSpace = { param($request) [pscustomobject]@{ VolumeAvailableBytes = 'n/a'; UserAvailableBytes = 'n/a' } }
+}
+$spaceThrew = $false
+$space = $null
+try { $space = Get-RecoveryDestinationSpace -Path 'D:\out' -Provider $provider -ReserveBytes 1000 } catch { $spaceThrew = $true }
+
+$root = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ('cast-probe-' + [guid]::NewGuid().ToString('N')))
+$null = [System.IO.Directory]::CreateDirectory($root)
+$logPath = [System.IO.Path]::Combine($root, 'events.jsonl')
+[System.IO.File]::WriteAllText($logPath, ('{"EventId":"x","Sequence":"not-a-number","JobId":"ProbeJob"}' + [char]10), (New-Object System.Text.UTF8Encoding($false)))
+$logThrew = $false
+$logVerdict = $null
+try { $logVerdict = Test-RecoveryLog -Path $logPath -JobId 'ProbeJob' } catch { $logThrew = $true }
+try { [System.IO.Directory]::Delete($root, $true) } catch { }
+
+[pscustomobject]@{
+    SpaceThrew = [bool]$spaceThrew
+    SpaceUnknown = [bool]$space.IsUnknown
+    SpaceReason = [string]$space.ReasonCode
+    LogThrew = [bool]$logThrew
+    LogValid = [bool]$logVerdict.IsValid
+    LogReason = [string]$logVerdict.ReasonCode
+}
+'@
+        $result.SpaceThrew | Should -BeFalse
+        $result.SpaceUnknown | Should -BeTrue
+        $result.SpaceReason | Should -Be 'CapacityUnknown'
+        $result.LogThrew | Should -BeFalse
+        $result.LogValid | Should -BeFalse
+        $result.LogReason | Should -Be 'LogSequenceInvalid'
     }
 
     It 'refuses a technician UI and an application path containing a quote without throwing' {
