@@ -75,8 +75,8 @@ errors, not warnings.
 | `WorkflowVersion` | Yes | The workflow revision string recorded in the case state and log. |
 | `FileScavengerPath` | No | The explicit File Scavenger executable path. With no value, discovery must produce exactly one verified candidate or you get a gate. |
 | `RStudioPath` | No | The explicit R-Studio for Windows executable path. It is never interpreted as an Agent or Emergency utility. |
-| `ValidatedFileScavengerBuilds` | Yes | Builds you have validated on a live case. Empty means every File Scavenger UI action stays a manual gate. A download URL is not a validated build. |
-| `ValidatedRStudioBuilds` | Yes | Same rule for R-Studio. Empty means the handoff is offered only as a manual identity gate. |
+| `ValidatedFileScavengerBuilds` | Yes | Builds you have validated on a live case. Empty means the real run stops at pre-flight with a G-01 `BuildNotValidated` gate; it does not permit a manual File Scavenger run. A download URL is not a validated build. |
+| `ValidatedRStudioBuilds` | Yes | Same rule for R-Studio. Empty means the real run stops at pre-flight with a G-01 `BuildNotValidated` gate; it does not offer the R-Studio handoff. |
 | `DestinationRoot` | No | The destination root. It is still resolved and separated from the source before use. |
 | `CapacityReserveBytes` | Yes | Your free-space reserve. An unavailable capacity reading is treated as unknown and blocks output work. |
 | `MaxJobPathLength` | No | Defaults to the 200-character design budget. Lower is allowed; higher is not a fix for a long path. |
