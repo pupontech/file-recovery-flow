@@ -248,7 +248,9 @@ Public contract:
 - `Convert-RecoveryName -Name <string>` returns a deterministic ASCII component.
   The result alphabet is `[A-Za-z0-9._-]`, reserved device names and trailing
   spaces/periods are rejected or removed, empty results are errors, and the
-  client-name component is capped at 40 characters.
+  client-name component is capped at 40 characters. The exported
+  `Sanitize-RecoveryName` alias remains for callers of the earlier public
+  contract; it maps to this approved-verb function without an import warning.
 - `New-RecoveryJobFolder -RootPath <literal path> -ClientName <string>
   -Clock <provider> -ClaimProvider <provider>` creates and claims a new case
   folder without overwriting. The claim uses a `CreateNew`-style operation and a
@@ -287,7 +289,8 @@ Public contract:
   attempt ID, event type, result, source/destination identity references, gate
   decision, and structured error details where applicable.
 - `Sync-RecoveryLog -Writer <object>` flushes the durable event and returns a
-  failure rather than silently continuing.
+  failure rather than silently continuing. The exported `Flush-RecoveryLog`
+  alias remains for compatibility.
 - `Test-RecoveryLog -Path <literal path>` detects malformed JSONL, missing or
   duplicate sequences, wrong job ID, and truncation.
 
@@ -322,7 +325,8 @@ Public contract:
   writes the boundary event and snapshot only when the transition is legal.
 - `Lock-RecoveryJob -JobPath <literal path> -LockProvider <provider>`
   obtains an exclusive lock before reading resume state. A stale lock is a gate,
-  not an invitation to delete it.
+  not an invitation to delete it. The exported `Acquire-RecoveryJobLock` alias
+  remains for compatibility.
 - `Get-RecoveryResumeDecision -State -FreshSourceIdentity -FreshDestinationIdentity
   -FreshSpace` returns `ResumeNext`, `NeedsReview`, or `FailedClosed` and never
   starts a vendor attempt.

@@ -589,9 +589,13 @@ function Sync-RecoveryLog {
     return $result
 }
 
+Set-Alias -Name Flush-RecoveryLog -Value Sync-RecoveryLog -Scope Local
+
 Export-ModuleMember -Function @(
     'Sync-RecoveryLog',
     'New-RecoveryLog',
     'Test-RecoveryLog',
     'Write-RecoveryLogEntry'
+) -Alias @(
+    'Flush-RecoveryLog'
 )

@@ -1314,6 +1314,8 @@ function Get-RecoveryResumeDecision {
     return $result
 }
 
+Set-Alias -Name Acquire-RecoveryJobLock -Value Lock-RecoveryJob -Scope Local
+
 Export-ModuleMember -Function @(
     'Lock-RecoveryJob',
     'Get-RecoveryResumeDecision',
@@ -1322,4 +1324,6 @@ Export-ModuleMember -Function @(
     'Set-RecoveryState',
     'Test-RecoveryStateTransition',
     'Write-RecoveryJobState'
+) -Alias @(
+    'Acquire-RecoveryJobLock'
 )

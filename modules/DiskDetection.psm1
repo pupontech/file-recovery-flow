@@ -1103,6 +1103,8 @@ function New-RecoveryJobFolder {
     return $result
 }
 
+Set-Alias -Name Sanitize-RecoveryName -Value Convert-RecoveryName -Scope Local
+
 Export-ModuleMember -Function @(
     'Get-PhysicalDiskIdentity',
     'Get-RecoveryDestinationSpace',
@@ -1113,4 +1115,6 @@ Export-ModuleMember -Function @(
     'Convert-RecoveryName',
     'Select-DestinationFolder',
     'Test-DestinationSafety'
+) -Alias @(
+    'Sanitize-RecoveryName'
 )

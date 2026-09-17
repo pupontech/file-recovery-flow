@@ -2163,10 +2163,13 @@ Describe 'Module source contracts' {
         ($stateExports -join '|') | Should -Be ($expectedState -join '|')
     }
 
-    It 'does not export commands with unapproved PowerShell verbs' {
+    It 'exports approved canonical verbs and warning-free compatibility aliases' {
         $diskExports = (Get-Module -Name DiskDetection).ExportedFunctions.Keys
         $logExports = (Get-Module -Name RecoveryLogging).ExportedFunctions.Keys
         $stateExports = (Get-Module -Name JobState).ExportedFunctions.Keys
+        $diskAliases = (Get-Module -Name DiskDetection).ExportedAliases.Keys
+        $logAliases = (Get-Module -Name RecoveryLogging).ExportedAliases.Keys
+        $stateAliases = (Get-Module -Name JobState).ExportedAliases.Keys
 
         $diskExports | Should -Not -Contain 'Sanitize-RecoveryName'
         $logExports | Should -Not -Contain 'Flush-RecoveryLog'
@@ -2174,5 +2177,18 @@ Describe 'Module source contracts' {
         $diskExports | Should -Contain 'Convert-RecoveryName'
         $logExports | Should -Contain 'Sync-RecoveryLog'
         $stateExports | Should -Contain 'Lock-RecoveryJob'
+        $diskAliases | Should -Contain 'Sanitize-RecoveryName'
+        $logAliases | Should -Contain 'Flush-RecoveryLog'
+        $stateAliases | Should -Contain 'Acquire-RecoveryJobLock'
+
+        (Sanitize-RecoveryName -Name 'Client Name') | Should -Be 'Client_Name'
+        $legacyLogPath = Join-Path -Path $TestDrive -ChildPath 'legacy-alias.jsonl'
+        $legacyLog = New-RecoveryLog -Path $legacyLogPath -JobId 'LEGACY-ALIAS' -Clock (New-FixedClock)
+        (Flush-RecoveryLog -Writer $legacyLog.Writer).Success | Should -BeTrue
+        $legacyLockFolder = Join-Path -Path $TestDrive -ChildPath 'legacy-alias-lock'
+        New-Item -ItemType Directory -Path $legacyLockFolder -Force | Out-Null
+        $legacyClaim = '{"ClaimId":"LEGACY-CLAIM","ClientName":"Legacy","FolderName":"legacy-alias-lock","CreatedUtc":"2026-09-16T07:00:00Z","CollisionIndex":0}'
+        [System.IO.File]::WriteAllText((Join-Path -Path $legacyLockFolder -ChildPath 'job-claim.json'), $legacyClaim, (New-Object System.Text.UTF8Encoding($false)))
+        (Acquire-RecoveryJobLock -JobPath $legacyLockFolder -Clock (New-FixedClock)).Acquired | Should -BeTrue
     }
 }
