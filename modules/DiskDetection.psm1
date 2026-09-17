@@ -1020,8 +1020,27 @@ function Invoke-RecoveryPreclaimSafety {
     # Optional for standalone folder callers; the production orchestrator supplies
     # this gate. Only one explicit Boolean approval can authorize each write.
     if ($null -eq $Check) { return [pscustomobject]@{ Allowed = $true; ReasonCode = $null; Message = $null } }
+    # The candidate folder does not exist when the first stage runs, so the gate
+    # also publishes the nearest existing ancestor: that is the path whose physical
+    # placement can actually be proven, and the callback must use it instead of
+    # asking the provider about a path that cannot be resolved yet.
+    $proofPath = $Path
+    $guard = 0
+    while (-not [System.IO.Directory]::Exists($proofPath) -and $guard -lt 64) {
+        $guard = $guard + 1
+        $parent = [System.IO.Path]::GetDirectoryName($proofPath)
+        if ([string]::IsNullOrEmpty($parent) -or $parent -eq $proofPath) { break }
+        $proofPath = $parent
+    }
     try {
-        $checks = @(& $Check ([pscustomobject]@{ Path = $Path; RootPath = $RootPath; Stage = $Stage }))
+        $checks = @(& $Check ([pscustomobject]@{
+            Path = $Path
+            PathExists = ([System.IO.Directory]::Exists($Path) -or [System.IO.File]::Exists($Path))
+            ProofPath = $proofPath
+            ProofPathExists = [System.IO.Directory]::Exists($proofPath)
+            RootPath = $RootPath
+            Stage = $Stage
+        }))
     }
     catch { return [pscustomobject]@{ Allowed = $false; ReasonCode = 'PreclaimSafetyUnproven'; Message = $_.Exception.Message } }
     $allowed = $null

@@ -1002,4 +1002,42 @@ Get-RecoveryAutomationElevationArgumentLine -ScriptPath 'C:\Recovery Jobs\Recove
             }
         }
     }
+
+
+    Context 'Pre-write case safety wiring (C-23 follow-up)' {
+        # The folder helper keeps an optional proof callback for the documented
+        # standalone contract, so nothing stops a future edit from dropping the
+        # argument at the one call site that creates a real case. That edit would
+        # silently restore the defect this gate exists to close, with every test
+        # still green. These contracts pin the wiring itself.
+        It 'the entry point proves the candidate path before the case folder or claim is written' {
+            $entryPath = Join-Path -Path $script:RepositoryRoot -ChildPath 'RecoveryAutomation.ps1'
+            $text = [System.IO.File]::ReadAllText($entryPath, (New-Object System.Text.UTF8Encoding($false)))
+
+            $text.Contains('New-RecoveryJobFolder -RootPath') | Should -BeTrue
+            $text.Contains('-PreclaimSafetyCheck $preclaimSafetyCheck') | Should -BeTrue
+            $text.Contains('$preclaimSafetyCheck = {') | Should -BeTrue
+        }
+
+        It 'the folder helper proves the candidate path at both write stages' {
+            $modulePath = Join-Path -Path $script:RepositoryRoot -ChildPath 'modules/DiskDetection.psm1'
+            $text = [System.IO.File]::ReadAllText($modulePath, (New-Object System.Text.UTF8Encoding($false)))
+
+            $text.Contains('function Invoke-RecoveryPreclaimSafety') | Should -BeTrue
+            $text.Contains("-Stage 'BeforeDirectoryCreate'") | Should -BeTrue
+            $text.Contains("-Stage 'BeforeClaimWrite'") | Should -BeTrue
+            $text.Contains('[scriptblock]$PreclaimSafetyCheck') | Should -BeTrue
+        }
+
+        It 'the pre-claim gate refuses anything but one explicit Boolean approval' {
+            $modulePath = Join-Path -Path $script:RepositoryRoot -ChildPath 'modules/DiskDetection.psm1'
+            $text = [System.IO.File]::ReadAllText($modulePath, (New-Object System.Text.UTF8Encoding($false)))
+
+            $text.Contains('if ($allowed -is [bool] -and $allowed) {') | Should -BeTrue
+            $text.Contains("'PreclaimSafetyUnproven'") | Should -BeTrue
+            # The gate must publish a path that can actually be resolved: the
+            # candidate folder does not exist when the first stage runs.
+            $text.Contains('ProofPath = $proofPath') | Should -BeTrue
+        }
+    }
 }

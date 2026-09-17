@@ -20,6 +20,12 @@ Describe 'Job folder preclaim safety boundary' {
         $calls.Count | Should -Be 1
         $calls[0].Stage | Should -Be 'BeforeDirectoryCreate'
         [System.IO.Path]::GetDirectoryName($calls[0].Path) | Should -Be $root
+        # The candidate does not exist, so the gate must hand the callback the path
+        # that can actually be proven. A gate that only offered the candidate would
+        # be unanswerable for every healthy run.
+        $calls[0].PathExists | Should -BeFalse
+        $calls[0].ProofPath | Should -Be $root
+        $calls[0].ProofPathExists | Should -Be $true
         @([System.IO.Directory]::GetFileSystemEntries($root)).Count | Should -Be 0
     }
 

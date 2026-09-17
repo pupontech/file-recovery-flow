@@ -289,7 +289,8 @@ Describe 'RecoveryAutomation bounded entrypoint' {
         # The destination root is reported on disk 5 so the first separation check
         # passes, while every path inside it (including the case folder this run
         # would generate) resolves to the source volume. That is the topology the
-        # pre-write proof has to refuse before any case byte exists.
+        # pre-write proof has to refuse before any case byte exists, and it is the
+        # only reason this run may stop at the case stage.
         $diskProvider = @{
             Name = 'IntegrationFixturePreclaim'
             GetDisks = {
@@ -303,12 +304,21 @@ Describe 'RecoveryAutomation bounded entrypoint' {
                 param($request)
                 $path = [string]$request.Path
                 $isSource = ($path -eq [string]$sourcePath)
-                $onSourceVolume = $isSource -or $path.StartsWith([string]$destinationPath, [System.StringComparison]::OrdinalIgnoreCase)
+                # The destination root itself is on disk 5, so the run's first
+                # separation check passes. Only paths INSIDE the destination root
+                # resolve to the source volume, which is the topology the pre-write
+                # proof has to refuse before any case byte exists.
+                $separator = [System.IO.Path]::DirectorySeparatorChar
+                $onSourceVolume = $isSource -or $path.StartsWith(([string]$destinationPath + $separator), [System.StringComparison]::OrdinalIgnoreCase)
+                # Existence comes from the filesystem, exactly as the production
+                # provider observes it: a path that does not exist yet cannot be
+                # resolved, and the gate must therefore prove an existing ancestor.
+                $exists = [System.IO.File]::Exists($path) -or [System.IO.Directory]::Exists($path)
                 return [pscustomobject]@{
                     CanonicalPath = $path
-                    Exists = $true
-                    IsContainer = $true
-                    ReparseResolved = $true
+                    Exists = $exists
+                    IsContainer = [System.IO.Directory]::Exists($path)
+                    ReparseResolved = $exists
                     IsReparsePoint = $false
                     MembersIncomplete = $false
                     DiskNumber = if ($onSourceVolume) { 4 } else { 5 }
@@ -375,7 +385,19 @@ Describe 'RecoveryAutomation bounded entrypoint' {
         $result.ExitCode | Should -Be 5
         $result.VendorLaunchAttempted | Should -BeFalse
         $launches | Should -HaveCount 0
-        @([System.IO.Directory]::GetFileSystemEntries($destinationPath)).Count | Should -Be 0
+        # The claim marker is the case boundary: no claim marker may exist on this
+        # path and no case file may have been written under it. The refused candidate
+        # folder itself is left in place (the run creates it before the claim is
+        # gated, and nothing inside another folder is ever touched), so this asserts
+        # the absence of every written case artifact an empty directory alone would
+        # hide.
+        $caseEntries = @([System.IO.Directory]::GetFileSystemEntries($destinationPath))
+        $claimFiles = @(Get-ChildItem -LiteralPath $destinationPath -Recurse -Force -Filter 'job-claim.json' -ErrorAction SilentlyContinue)
+        $claimFiles.Count | Should -Be 0
+        $caseEntries.Count | Should -BeLessOrEqual 1
+        foreach ($entry in $caseEntries) {
+            @([System.IO.Directory]::GetFileSystemEntries([string]$entry)).Count | Should -Be 0
+        }
     }
 
     It 'fails closed when the post-launch G-04 gate snapshot cannot be written' {

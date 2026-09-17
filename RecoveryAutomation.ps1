@@ -2734,13 +2734,27 @@ function Invoke-RecoveryAutomation {
         # is about to be generated is a different path and is proven separately
         # before the folder or its claim marker can exist. Getting this wrong is how
         # a claim marker used to appear on media that was never proven separate.
+        #
+        # The candidate folder does not exist yet, so it cannot be resolved by
+        # itself: the proof is taken on the nearest existing ancestor (which is the
+        # destination root for the first candidate) and the candidate is required
+        # to be absent. A path that already exists is never adopted or merged with.
         $diskProviderForClaimCheck = $DiskProvider
         $sourceForClaimCheck = $sourceIdentity
         $preclaimSafetyCheck = {
             param($request)
-            $candidateIdentity = DiskDetection\Resolve-RecoveryPathIdentity -Path ([string]$request.Path) -Provider $diskProviderForClaimCheck
+            $proofPath = [string]$request.ProofPath
+            if ([string]::IsNullOrWhiteSpace($proofPath) -or $request.ProofPathExists -ne $true) {
+                return [pscustomobject]@{ Allowed = $false; ReasonCode = 'CandidateAncestorUnresolved' }
+            }
+            # The candidate itself is never adopted or merged with: a path that
+            # already holds anything belongs to somebody else.
+            if ($request.PathExists -eq $true -and [string]$request.Stage -eq 'BeforeDirectoryCreate') {
+                return [pscustomobject]@{ Allowed = $false; ReasonCode = 'CandidateAlreadyExists' }
+            }
+            $candidateIdentity = DiskDetection\Resolve-RecoveryPathIdentity -Path $proofPath -Provider $diskProviderForClaimCheck
             $candidateSeparation = DiskDetection\Test-DestinationSafety -SourceIdentity $sourceForClaimCheck `
-                -DestinationPath ([string]$request.Path) -Provider $diskProviderForClaimCheck -DestinationIdentity $candidateIdentity
+                -DestinationPath $proofPath -Provider $diskProviderForClaimCheck -DestinationIdentity $candidateIdentity
             return [pscustomobject]@{ Allowed = [bool]$candidateSeparation.Allowed; ReasonCode = $candidateSeparation.ReasonCode }
         }.GetNewClosure()
         $folderResult = DiskDetection\New-RecoveryJobFolder -RootPath ([string]$destinationText) `
