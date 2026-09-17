@@ -757,6 +757,239 @@ function Request-RStudioForegroundActivation {
     }
 }
 
+function ConvertTo-RStudioStartTimeUtc {
+    [CmdletBinding()]
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+    if ($Value -is [datetime]) {
+        return ([datetime]$Value).ToUniversalTime()
+    }
+    if ($Value -is [datetimeoffset]) {
+        return ([datetimeoffset]$Value).UtcDateTime
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$Value)) {
+        return $null
+    }
+    $parsed = [datetime]::MinValue
+    if ([datetime]::TryParse([string]$Value, [ref]$parsed)) {
+        return $parsed.ToUniversalTime()
+    }
+    return $null
+}
+
+function Get-RStudioLivenessDecision {
+    <#
+    .SYNOPSIS
+        Reads the runner's explicit liveness statement.
+
+    .DESCRIPTION
+        A launched handoff is only claimed when the runner states whether the
+        process it started is alive. 'Alive', 'IsAlive', and 'Running' state
+        liveness positively; 'HasExited', 'Exited', and 'IsExited' state it
+        negatively. A statement that cannot be read as a Boolean, a stated death,
+        or two statements that contradict each other are all refusals, so a
+        possibly-started but uncertain launch is never reported as an ordinary
+        launch failure that could invite a retry.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][object]$RunnerResult)
+
+    $aliveStated = $false
+    $notAliveStated = $false
+    $livenessStated = $false
+    $unclear = $false
+
+    foreach ($name in @('Alive', 'IsAlive', 'Running')) {
+        if (-not (Test-RSObjectProperty -InputObject $RunnerResult -Name $name)) {
+            continue
+        }
+        $value = Get-RSObjectPropertyValue -InputObject $RunnerResult -Names @($name)
+        $livenessStated = $true
+        if ($value -isnot [bool]) {
+            $unclear = $true
+            continue
+        }
+        if ([bool]$value) {
+            $aliveStated = $true
+        }
+        else {
+            $notAliveStated = $true
+        }
+    }
+    foreach ($name in @('HasExited', 'Exited', 'IsExited')) {
+        if (-not (Test-RSObjectProperty -InputObject $RunnerResult -Name $name)) {
+            continue
+        }
+        $value = Get-RSObjectPropertyValue -InputObject $RunnerResult -Names @($name)
+        $livenessStated = $true
+        if ($value -isnot [bool]) {
+            $unclear = $true
+            continue
+        }
+        if ([bool]$value) {
+            $notAliveStated = $true
+        }
+        else {
+            $aliveStated = $true
+        }
+    }
+
+    if (-not $livenessStated) {
+        return [pscustomobject]@{ Valid = $false; ReasonCode = 'ProcessLivenessUnstated'; Reason = 'The process runner did not state whether the started process is alive.' }
+    }
+    if ($unclear) {
+        return [pscustomobject]@{ Valid = $false; ReasonCode = 'ProcessLivenessUnclear'; Reason = 'The process runner stated liveness as a non-Boolean value.' }
+    }
+    if ($aliveStated -and $notAliveStated) {
+        return [pscustomobject]@{ Valid = $false; ReasonCode = 'ProcessLivenessContradictory'; Reason = 'The process runner stated both that the process is alive and that it is not.' }
+    }
+    if ($notAliveStated) {
+        return [pscustomobject]@{ Valid = $false; ReasonCode = 'ProcessNotAlive'; Reason = 'The process runner stated that the process is not running.' }
+    }
+
+    return [pscustomobject]@{ Valid = $true; ReasonCode = $null; Reason = $null }
+}
+
+function Get-RStudioHandoffLaunchOutcome {
+    <#
+    .SYNOPSIS
+        Invokes the handoff process runner and classifies its single result.
+
+    .DESCRIPTION
+        The runner output is normalized to exactly one result, and that result
+        must state an explicit Boolean success, the executable path it actually
+        started (matching the verified executable), a usable start time, and an
+        explicit, non-contradictory liveness statement before the handoff counts
+        as launched.
+
+        Every other shape is a handoff-review outcome: the runner was invoked, so
+        an R-Studio process may exist. The candidate identity is retained when
+        the result identifies a process, the launch is not claimed, and the caller
+        permits no automatic retry and no forced close.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$ProcessRunner,
+        [Parameter(Mandatory = $true)][object]$Request,
+        [AllowNull()][AllowEmptyString()][string]$ExecutablePath
+    )
+
+    $outcome = [pscustomobject]@{
+        Decision          = 'HandoffReview'
+        ReasonCode        = $null
+        Launched          = $false
+        ProcessIdentity   = $null
+        RunnerInvoked     = $false
+        Error             = $null
+        Evidence          = @{}
+    }
+
+    try {
+        $runnerOutput = @(& $ProcessRunner $Request)
+        $outcome.RunnerInvoked = $true
+    }
+    catch {
+        $outcome.ReasonCode = 'ProcessLaunchFailed'
+        $outcome.Error = $_.Exception.Message
+        $outcome.Evidence['LaunchError'] = $_.Exception.Message
+        $outcome.Evidence['LaunchResult'] = 'The process runner failed while starting R-Studio; a vendor process may be running.'
+        return $outcome
+    }
+
+    if ($runnerOutput.Count -eq 0) {
+        $outcome.ReasonCode = 'ProcessIdentityMissing'
+        $outcome.Evidence['LaunchResult'] = 'The process runner returned no process identity.'
+        return $outcome
+    }
+    if ($runnerOutput.Count -ne 1) {
+        $outcome.ReasonCode = 'AmbiguousProcessIdentity'
+        $outcome.Evidence['LaunchResult'] = 'The process runner returned more than one process identity, so the started process cannot be identified.'
+        return $outcome
+    }
+
+    $runnerResult = $runnerOutput[0]
+
+    $processId = Get-RSFirstNonNullPropertyValue -InputObject $runnerResult -Names @('ProcessId', 'Id')
+    $numericProcessId = 0
+    if ($null -ne $processId) {
+        try { $numericProcessId = [int]$processId }
+        catch { $numericProcessId = 0 }
+    }
+
+    $actualPath = Get-RSFirstNonNullPropertyValue -InputObject $runnerResult -Names @('Path', 'ExecutablePath', 'MainModulePath')
+    $startTime = ConvertTo-RStudioStartTimeUtc -Value (Get-RSFirstNonNullPropertyValue -InputObject $runnerResult -Names @('StartTimeUtc', 'StartTime'))
+    $processName = [string](Get-RSObjectPropertyValue -InputObject $runnerResult -Names @('Name', 'ProcessName'))
+    $mainWindowHandle = Get-RSObjectPropertyValue -InputObject $runnerResult -Names @('MainWindowHandle')
+
+    # A candidate identity is whatever the runner actually reported. It is kept
+    # for review even when the launch cannot be trusted, and it never claims a
+    # verification that did not happen.
+    if ($numericProcessId -gt 0) {
+        $outcome.ProcessIdentity = [pscustomobject]@{
+            Product          = $script:RSProductName
+            ExecutablePath   = [string]$actualPath
+            ProcessId        = $numericProcessId
+            Name             = $processName
+            StartTimeUtc     = $startTime
+            MainWindowHandle = $mainWindowHandle
+            IdentityStatus   = 'Candidate'
+        }
+    }
+
+    if ($numericProcessId -le 0) {
+        $outcome.ReasonCode = 'ProcessIdentityMissing'
+        $outcome.Evidence['LaunchResult'] = 'The process runner returned an unusable process identity.'
+        return $outcome
+    }
+
+    if (-not (Test-RSObjectProperty -InputObject $runnerResult -Name 'Success') -or
+        $runnerResult.Success -isnot [bool] -or -not [bool]$runnerResult.Success) {
+        $outcome.ReasonCode = 'ProcessResultUnverified'
+        $outcome.Evidence['LaunchResult'] = 'The process runner did not return an explicit Success=true result.'
+        return $outcome
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$actualPath)) {
+        $outcome.ReasonCode = 'ProcessPathMissing'
+        $outcome.Evidence['LaunchResult'] = 'The process runner returned no actual executable path.'
+        return $outcome
+    }
+    if (-not [string]::Equals(([string]$actualPath).Trim(), ([string]$ExecutablePath).Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+        $outcome.ReasonCode = 'ProcessPathMismatch'
+        $outcome.Evidence['RequestedExecutablePath'] = $ExecutablePath
+        $outcome.Evidence['ActualExecutablePath'] = [string]$actualPath
+        return $outcome
+    }
+
+    if ($null -eq $startTime) {
+        $outcome.ReasonCode = 'ProcessStartTimeMissing'
+        $outcome.Evidence['LaunchResult'] = 'The process runner returned no usable process start time.'
+        return $outcome
+    }
+
+    $liveness = Get-RStudioLivenessDecision -RunnerResult $runnerResult
+    if (-not $liveness.Valid) {
+        $outcome.ReasonCode = $liveness.ReasonCode
+        $outcome.Evidence['LaunchResult'] = $liveness.Reason
+        return $outcome
+    }
+
+    $outcome.Decision = 'HandoffLaunched'
+    $outcome.Launched = $true
+    $outcome.ProcessIdentity = [pscustomobject]@{
+        Product          = $script:RSProductName
+        ExecutablePath   = [string]$actualPath
+        ProcessId        = $numericProcessId
+        Name             = $processName
+        StartTimeUtc     = $startTime
+        MainWindowHandle = $mainWindowHandle
+    }
+    return $outcome
+}
+
 function Start-RStudioHandoff {
     [CmdletBinding()]
     param(
@@ -782,6 +1015,8 @@ function Start-RStudioHandoff {
     $activation = $null
     $mainPanelGate = $null
     $launched = $false
+    $runnerInvoked = $false
+    $requiresHandoffReview = $false
     $decision = 'Blocked'
     $reasonCode = $preconditions.ReasonCode
     $evidence = @{ PreconditionDecision = $preconditions.Decision }
@@ -814,123 +1049,67 @@ function Start-RStudioHandoff {
                     ArgumentString = $argumentString
                     UseShellExecute = $false
                 }
-                $runnerResult = $null
-                try {
-                    $runnerResult = & $ProcessRunner $request
+                $launchOutcome = Get-RStudioHandoffLaunchOutcome -ProcessRunner $ProcessRunner -Request $request -ExecutablePath $executablePath
+                $runnerInvoked = [bool]$launchOutcome.RunnerInvoked
+                foreach ($key in @($launchOutcome.Evidence.Keys)) {
+                    $evidence[$key] = $launchOutcome.Evidence[$key]
                 }
-                catch {
-                    $decision = 'Failed'
-                    $reasonCode = 'ProcessLaunchFailed'
-                    $evidence['LaunchError'] = $_.Exception.Message
-                }
+                $normalizedIdentity = $launchOutcome.ProcessIdentity
 
-                if ($decision -ne 'Failed') {
-                    $processId = Get-RSFirstNonNullPropertyValue -InputObject $runnerResult -Names @('ProcessId', 'Id')
-                    if ($null -eq $processId) {
-                        $decision = 'Failed'
-                        $reasonCode = 'ProcessIdentityMissing'
-                        $evidence['LaunchResult'] = 'The process runner returned no process identity.'
+                if ($launchOutcome.Launched) {
+                    $activation = Request-RStudioForegroundActivation -ProcessIdentity $normalizedIdentity -ActivationProvider $ActivationProvider
+                    $gateEvidence = @{
+                        ExecutablePath = [string]$normalizedIdentity.ExecutablePath
+                        Arguments      = $arguments
+                        ProcessId      = $normalizedIdentity.ProcessId
+                        StartTimeUtc   = $normalizedIdentity.StartTimeUtc
                     }
-                    else {
-                        $numericProcessId = 0
-                        try { $numericProcessId = [int]$processId }
-                        catch { $numericProcessId = 0 }
-                        if ($numericProcessId -le 0) {
-                            $decision = 'Failed'
-                            $reasonCode = 'ProcessIdentityMissing'
-                            $evidence['LaunchResult'] = 'The process runner returned an unusable process identity.'
-                        }
-                        elseif (-not (Test-RSObjectProperty -InputObject $runnerResult -Name 'Success') -or
-                            $runnerResult.Success -isnot [bool] -or -not [bool]$runnerResult.Success) {
-                            $decision = 'Failed'
-                            $reasonCode = 'ProcessResultUnverified'
-                            $evidence['LaunchResult'] = 'The process runner did not return an explicit Success=true result.'
-                        }
-                        else {
-                            $actualPath = Get-RSFirstNonNullPropertyValue -InputObject $runnerResult -Names @('Path', 'ExecutablePath', 'MainModulePath')
-                            if ([string]::IsNullOrWhiteSpace([string]$actualPath)) {
-                                $decision = 'Failed'
-                                $reasonCode = 'ProcessPathMissing'
-                                $evidence['LaunchResult'] = 'The process runner returned no actual executable path.'
-                            }
-                            elseif (-not [string]::Equals(([string]$actualPath).Trim(), ([string]$executablePath).Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
-                                $decision = 'Failed'
-                                $reasonCode = 'ProcessPathMismatch'
-                                $evidence['RequestedExecutablePath'] = $executablePath
-                                $evidence['ActualExecutablePath'] = [string]$actualPath
-                            }
-                            else {
-                                $rawStartTime = Get-RSFirstNonNullPropertyValue -InputObject $runnerResult -Names @('StartTimeUtc', 'StartTime')
-                                $startTime = $null
-                                if ($rawStartTime -is [datetime]) {
-                                    $startTime = ([datetime]$rawStartTime).ToUniversalTime()
-                                }
-                                elseif ($rawStartTime -is [datetimeoffset]) {
-                                    $startTime = ([datetimeoffset]$rawStartTime).UtcDateTime
-                                }
-                                elseif ($null -ne $rawStartTime -and -not [string]::IsNullOrWhiteSpace([string]$rawStartTime)) {
-                                    $parsedStartTime = [datetime]::MinValue
-                                    if ([datetime]::TryParse([string]$rawStartTime, [ref]$parsedStartTime)) {
-                                        $startTime = $parsedStartTime.ToUniversalTime()
-                                    }
-                                }
-                                if ($null -eq $startTime -or $startTime -eq [datetime]::MinValue) {
-                                    $decision = 'Failed'
-                                    $reasonCode = 'ProcessStartTimeMissing'
-                                    $evidence['LaunchResult'] = 'The process runner returned no usable process start time.'
-                                }
-                                else {
-                                    $mainWindowHandle = Get-RSObjectPropertyValue -InputObject $runnerResult -Names @('MainWindowHandle')
-                                    $normalizedIdentity = [pscustomobject]@{
-                                        Product          = $script:RSProductName
-                                        ExecutablePath   = [string]$actualPath
-                                        ProcessId        = $numericProcessId
-                                        Name             = [string](Get-RSObjectPropertyValue -InputObject $runnerResult -Names @('Name', 'ProcessName'))
-                                        StartTimeUtc     = $startTime
-                                        MainWindowHandle = $mainWindowHandle
-                                    }
-                                    $activation = Request-RStudioForegroundActivation -ProcessIdentity $normalizedIdentity -ActivationProvider $ActivationProvider
-                                    $gateEvidence = @{
-                                        ExecutablePath = [string]$actualPath
-                                        Arguments      = $arguments
-                                        ProcessId      = $numericProcessId
-                                        StartTimeUtc   = $startTime
-                                    }
-                                    $mainPanelGate = New-RSHandoffGate -Evidence $gateEvidence
-                                    $launched = $true
-                                    $decision = 'HandoffLaunched'
-                                    $reasonCode = $null
-                                    $evidence['ProcessId'] = $numericProcessId
-                                    $evidence['ActualExecutablePath'] = [string]$actualPath
-                                    $evidence['ProcessStartTimeUtc'] = $startTime
-                                    $evidence['LaunchOnly'] = $true
-                                }
-                            }
-                        }
-                    }
+                    $mainPanelGate = New-RSHandoffGate -Evidence $gateEvidence
+                    $launched = $true
+                    $decision = 'HandoffLaunched'
+                    $reasonCode = $null
+                    $evidence['ProcessId'] = $normalizedIdentity.ProcessId
+                    $evidence['ActualExecutablePath'] = [string]$normalizedIdentity.ExecutablePath
+                    $evidence['ProcessStartTimeUtc'] = $normalizedIdentity.StartTimeUtc
+                    $evidence['LaunchOnly'] = $true
+                }
+                else {
+                    # A possibly-started but uncertain launch is never reported as
+                    # an ordinary failure: the runner was invoked, so an R-Studio
+                    # process may exist. The candidate identity is retained and the
+                    # outcome requires an operator review before anything else.
+                    $decision = 'HandoffReview'
+                    $reasonCode = $launchOutcome.ReasonCode
+                    $requiresHandoffReview = $true
+                    $evidence['HandoffReview'] = $true
                 }
             }
         }
     }
 
     return [pscustomobject]@{
-        Task              = 'RStudioLaunchOnlyHandoff'
-        Decision          = $decision
-        ReasonCode        = $reasonCode
-        Launched          = $launched
-        IsLaunchOnly      = $true
-        AnalysisInvoked   = $false
-        CompletionClaimed = $false
-        Product           = $script:RSProductName
-        ExecutablePath    = $executablePath
-        Arguments         = $arguments
-        ArgumentString    = $argumentString
-        ProcessIdentity   = $normalizedIdentity
-        Activation        = $activation
-        MainPanelGate     = $mainPanelGate
-        Preconditions     = $preconditions
-        Evidence          = $evidence
-        CompletedAtUtc    = [datetime]::UtcNow
+        Task                  = 'RStudioLaunchOnlyHandoff'
+        Decision              = $decision
+        ReasonCode            = $reasonCode
+        Launched              = $launched
+        IsLaunchOnly          = $true
+        AnalysisInvoked       = $false
+        CompletionClaimed     = $false
+        RequiresHandoffReview = $requiresHandoffReview
+        RetryAllowed          = $false
+        ForcedCloseAllowed    = $false
+        RunnerInvoked         = $runnerInvoked
+        VendorProcessPossible = $runnerInvoked
+        Product               = $script:RSProductName
+        ExecutablePath        = $executablePath
+        Arguments             = $arguments
+        ArgumentString        = $argumentString
+        ProcessIdentity       = $normalizedIdentity
+        Activation            = $activation
+        MainPanelGate         = $mainPanelGate
+        Preconditions         = $preconditions
+        Evidence              = $evidence
+        CompletedAtUtc        = [datetime]::UtcNow
     }
 }
 

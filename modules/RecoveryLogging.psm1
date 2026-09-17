@@ -13,6 +13,16 @@
 # blocks. Each operation receives one hashtable request and either returns a
 # result or throws. A missing operation, a throw, or a returned false is a
 # failure.
+#
+# Integrity guard: before every append the writer compares the recorded file
+# length and the whole-content SHA-256 digest that was recorded when it opened
+# the record (create or resume). A length change, and a rewrite of any byte that
+# keeps the length, are both refused, and a refusal blocks every later write, so
+# this writer never appends on top of a record it does not own. The guarantee
+# starts at that open: a rewrite made before it - including one made before a
+# resume - has no earlier digest to be compared against and is not detectable.
+# This is an operational consistency guard for a single cooperative writer, not
+# tamper-proof storage and not immutable history.
 
 Set-StrictMode -Off
 
@@ -254,52 +264,54 @@ function Read-RecoveryLogBytes {
     }
 }
 
-function Get-RecoveryLogTailHash {
-    # Hash of the trailing window of the case record. The window is bounded so the
-    # check stays cheap while the case runs, and it is compared before every append:
-    # a changed length is caught by the offset, and a same-length rewrite is caught
-    # here. The residual limitation (a rewrite confined to bytes outside the window
-    # with an unchanged length) is recorded in the operator guide.
+function Get-RecoveryLogContentHash {
+    # Whole-content digest of the case record.
+    #
+    # The digest covers every byte that was written, so a rewrite that keeps the
+    # file length but changes any earlier byte is refused before the next append.
+    # The previous guard hashed only the trailing 256-byte window: a same-length
+    # rewrite of older history was accepted while the log was live, and a single
+    # record longer than the window left part of the newest record uncovered.
+    #
+    # The digest is streamed through a fixed 65536-byte buffer with [int64]
+    # arithmetic: no buffer is allocated for the whole file, and no file length is
+    # narrowed to Int32, so a long case record can neither truncate nor overflow
+    # the check. An unreadable or absent record returns $null, which every caller
+    # treats as a refusal rather than as an empty valid log.
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [int]$Length = 256
+        [Parameter(Mandatory = $true)][string]$Path
     )
 
-    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
-    if (-not [System.IO.File]::Exists($Path)) { return '' }
-    if ($Length -le 0) { $Length = 256 }
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    if (-not [System.IO.File]::Exists($Path)) { return $null }
+
+    $bufferSize = 65536
     $stream = $null
+    $sha = $null
     try {
-        $info = New-Object System.IO.FileInfo($Path)
-        $count = [int]$info.Length
-        if ($count -gt $Length) { $count = $Length }
         $stream = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-        if ($count -gt 0) { [void]$stream.Seek(-1 * [int64]$count, [System.IO.SeekOrigin]::End) }
-        $buffer = New-Object byte[] $count
-        $read = 0
-        while ($read -lt $count) {
-            $chunk = $stream.Read($buffer, $read, $count - $read)
-            if ($chunk -le 0) { break }
-            $read = $read + $chunk
-        }
-        if ($read -lt $count) { return '' }
         $sha = [System.Security.Cryptography.SHA256]::Create()
-        try {
-            $hash = $sha.ComputeHash($buffer)
+        $buffer = New-Object byte[] $bufferSize
+        while ($true) {
+            $read = $stream.Read($buffer, 0, $bufferSize)
+            if ($read -le 0) { break }
+            [void]$sha.TransformBlock($buffer, 0, $read, $null, 0)
         }
-        finally {
-            $sha.Dispose()
-        }
+        $empty = New-Object byte[] 0
+        [void]$sha.TransformFinalBlock($empty, 0, 0)
+        $hash = $sha.Hash
+        if ($null -eq $hash) { return $null }
         $builder = New-Object System.Text.StringBuilder
         foreach ($byte in $hash) { [void]$builder.Append($byte.ToString('x2', [System.Globalization.CultureInfo]::InvariantCulture)) }
         return $builder.ToString()
     }
     catch {
-        return ''
+        return $null
     }
     finally {
         if ($null -ne $stream) { $stream.Dispose() }
+        if ($null -ne $sha) { $sha.Dispose() }
     }
 }
 
@@ -327,8 +339,9 @@ function Get-RecoveryDefaultLogWriterProvider {
         # violation), and a temporary directory holding the file could not be
         # removed. Each event is instead appended and flushed on its own, so the
         # case record stays readable and removable at every moment while
-        # append-only integrity is still enforced by the recorded offset below.
-        $offset = 0
+        # append-only integrity is still enforced by the recorded offset and the
+        # whole-content digest below.
+        $offset = [int64]0
         try {
             if ($mode -eq 'CreateNew') {
                 $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
@@ -338,13 +351,21 @@ function Get-RecoveryDefaultLogWriterProvider {
                 return [pscustomobject]@{ Success = $false; ReasonCode = 'LogOpenFailed'; Message = 'The log to append to does not exist.' }
             }
             else {
-                $offset = [int](New-Object System.IO.FileInfo($path)).Length
+                $offset = (New-Object System.IO.FileInfo($path)).Length
             }
         }
         catch {
             return [pscustomobject]@{ Success = $false; ReasonCode = 'LogOpenFailed'; Message = $_.Exception.Message }
         }
-        $tailLength = 256
+        # Open, including resume, records the digest of the content it found. From
+        # that moment the record is compared before every append, so a rewrite of
+        # any byte - anywhere in the record, at any length - is refused. The
+        # guarantee starts here: a rewrite that happened before this open has no
+        # earlier digest to be compared against (documented limitation).
+        $contentHash = Get-RecoveryLogContentHash -Path $path
+        if ($null -eq $contentHash) {
+            return [pscustomobject]@{ Success = $false; ReasonCode = 'LogOpenFailed'; Message = 'The case record could not be read for whole-content verification.' }
+        }
         return [pscustomobject]@{
             Success = $true
             ReasonCode = $null
@@ -353,10 +374,11 @@ function Get-RecoveryDefaultLogWriterProvider {
             Path = $path
             Mode = $mode
             Offset = $offset
-            # The trailing window is hashed after every append, so a rewrite that
-            # keeps the byte length but changes the record is refused as well.
-            TailLength = $tailLength
-            TailHash = Get-RecoveryLogTailHash -Path $path -Length $tailLength
+            # The whole-content digest is compared before every append, so a
+            # rewrite that keeps the byte length but changes any earlier byte -
+            # including history far outside the last record - is refused too.
+            ContentHash = $contentHash
+            ContentGuard = 'WholeContentStreamingSha256'
         }
     }
     $provider.Append = {
@@ -368,7 +390,7 @@ function Get-RecoveryDefaultLogWriterProvider {
             return [pscustomobject]@{ Success = $false; ReasonCode = 'LogAppendFailed'; Message = 'The log is not open.' }
         }
         $path = [string]$providerHandle.Path
-        $expectedOffset = [int]$providerHandle.Offset
+        $expectedOffset = [int64]$providerHandle.Offset
         $bytes = [System.Text.Encoding]::ASCII.GetBytes([string]$request.Text)
         $stream = $null
         try {
@@ -379,12 +401,14 @@ function Get-RecoveryDefaultLogWriterProvider {
                 # instead of writing into a history it no longer owns.
                 return [pscustomobject]@{ Success = $false; ReasonCode = 'LogAppendFailed'; Message = 'The log length changed since the previous append; the record is not append-only.' }
             }
-            $tailHash = Get-RecoveryLogTailHash -Path $path -Length ([int]$providerHandle.TailLength)
-            if ($tailHash -ne [string]$providerHandle.TailHash) {
-                # The length is unchanged but the tail is not the tail that was
-                # written. A same-length rewrite would otherwise be accepted and the
-                # case would keep appending on top of edited history.
-                return [pscustomobject]@{ Success = $false; ReasonCode = 'LogAppendFailed'; Message = 'The log tail does not match the last append; the record was changed out of band.' }
+            $contentHash = Get-RecoveryLogContentHash -Path $path
+            if ($null -eq $contentHash -or $contentHash -ne [string]$providerHandle.ContentHash) {
+                # The whole-content digest is compared, not just the tail: a
+                # same-length rewrite of any earlier byte would otherwise be
+                # accepted and the case would keep appending on top of edited
+                # history, or would keep appending on a record that can no longer
+                # be read at all.
+                return [pscustomobject]@{ Success = $false; ReasonCode = 'LogAppendFailed'; Message = 'The log content does not match the digest recorded at the last append; the record was changed out of band or cannot be read.' }
             }
             $stream = New-Object System.IO.FileStream($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
             $stream.Write($bytes, 0, $bytes.Length)
@@ -396,8 +420,16 @@ function Get-RecoveryDefaultLogWriterProvider {
         finally {
             if ($null -ne $stream) { $stream.Dispose() }
         }
-        $providerHandle.Offset = $expectedOffset + $bytes.Length
-        $providerHandle.TailHash = Get-RecoveryLogTailHash -Path $path -Length ([int]$providerHandle.TailLength)
+        $refreshedHash = Get-RecoveryLogContentHash -Path $path
+        if ($null -eq $refreshedHash) {
+            # The record was written but its content can no longer be verified, so
+            # the append is not reported as a verified one. The offset is left
+            # unchanged, so the next append refuses as well instead of writing on
+            # top of a record this writer cannot check.
+            return [pscustomobject]@{ Success = $false; ReasonCode = 'LogAppendFailed'; Message = 'The written record could not be read back for whole-content verification.' }
+        }
+        $providerHandle.Offset = $expectedOffset + [int64]$bytes.Length
+        $providerHandle.ContentHash = $refreshedHash
         return [pscustomobject]@{ Success = $true; ReasonCode = $null; Message = $null }
     }
     $provider.Flush = {

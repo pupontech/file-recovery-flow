@@ -231,7 +231,9 @@ Describe 'RecoveryAutomation bounded entrypoint' {
         $fileRunner = {
             param($path)
             $launches.Add([string]$path) | Out-Null
-            return [pscustomobject]@{ Path = $path; Pid = 4811; StartTime = '2026-01-01T00:00:00Z' }
+            # Fixture runner statement: the launch contract requires an explicit
+            # Boolean success and an explicit liveness statement from the runner.
+            return [pscustomobject]@{ Success = $true; Path = $path; Pid = 4811; StartTime = '2026-01-01T00:00:00Z'; Alive = $true }
         }.GetNewClosure()
 
         $protectionCalls = New-Object System.Collections.Generic.List[string]
@@ -365,7 +367,9 @@ Describe 'RecoveryAutomation bounded entrypoint' {
         $fileRunner = {
             param($path)
             $launches.Add([string]$path) | Out-Null
-            return [pscustomobject]@{ Path = $path; Pid = 4811; StartTime = '2026-01-01T00:00:00Z' }
+            # Fixture runner statement: the launch contract requires an explicit
+            # Boolean success and an explicit liveness statement from the runner.
+            return [pscustomobject]@{ Success = $true; Path = $path; Pid = 4811; StartTime = '2026-01-01T00:00:00Z'; Alive = $true }
         }.GetNewClosure()
         $sourceProtection = { param($request) return $true }
 
@@ -475,7 +479,9 @@ Describe 'RecoveryAutomation bounded entrypoint' {
         }.GetNewClosure()
         $fileRunner = {
             param($path)
-            return [pscustomobject]@{ Path = $path; Pid = 4812; StartTime = '2026-01-01T00:00:00Z' }
+            # Fixture runner statement: the launch contract requires an explicit
+            # Boolean success and an explicit liveness statement from the runner.
+            return [pscustomobject]@{ Success = $true; Path = $path; Pid = 4812; StartTime = '2026-01-01T00:00:00Z'; Alive = $true }
         }.GetNewClosure()
         $stateWrites = New-Object System.Collections.Generic.List[string]
         $stateWriter = @{
@@ -685,11 +691,15 @@ Describe 'RecoveryAutomation bounded entrypoint' {
         }.GetNewClosure()
         $fileRunner = {
             param($path)
-            return [pscustomobject]@{ Path = $path; Pid = 4821; StartTime = '2026-01-01T00:00:00Z' }
+            # Fixture runner statement: the launch contract requires an explicit
+            # Boolean success and an explicit liveness statement from the runner.
+            return [pscustomobject]@{ Success = $true; Path = $path; Pid = 4821; StartTime = '2026-01-01T00:00:00Z'; Alive = $true }
         }.GetNewClosure()
         $handoffRunner = {
             param($request)
-            return [pscustomobject]@{ Success = $true; ProcessId = 7321; StartTimeUtc = '2026-01-01T00:00:00Z'; Name = 'RStudio'; Path = $rStudioPath }
+            # Fixture handoff statement: the handoff contract requires an explicit
+            # Boolean success and an explicit liveness statement from the runner.
+            return [pscustomobject]@{ Success = $true; ProcessId = 7321; StartTimeUtc = '2026-01-01T00:00:00Z'; Name = 'RStudio'; Path = $rStudioPath; HasExited = $false }
         }.GetNewClosure()
         $protectionCalls = New-Object System.Collections.Generic.List[string]
         $sourceProtection = {
@@ -778,7 +788,9 @@ Describe 'RecoveryAutomation bounded entrypoint' {
         $handoffRunner = {
             param($request)
             $handoffArguments.Add(@($request.Arguments)) | Out-Null
-            return [pscustomobject]@{ Success = $true; ProcessId = 7311; StartTimeUtc = '2026-01-01T00:00:00Z'; Name = 'RStudio'; Path = $executable.Path }
+            # Fixture handoff statement: the handoff contract requires an explicit
+            # Boolean success and an explicit liveness statement from the runner.
+            return [pscustomobject]@{ Success = $true; ProcessId = 7311; StartTimeUtc = '2026-01-01T00:00:00Z'; Name = 'RStudio'; Path = $executable.Path; HasExited = $false }
         }.GetNewClosure()
         $eventWriter = {
             param($event)
@@ -1245,7 +1257,9 @@ Describe 'Default front door and case cleanup (runtime regression)' {
             }.GetNewClosure()
             $fileRunner = {
                 param($path)
-                return [pscustomobject]@{ Path = $path; Pid = 4871; StartTime = '2026-01-01T00:00:00Z' }
+                # Fixture runner statement: the launch contract requires an explicit
+                # Boolean success and an explicit liveness statement from the runner.
+                return [pscustomobject]@{ Success = $true; Path = $path; Pid = 4871; StartTime = '2026-01-01T00:00:00Z'; Alive = $true }
             }.GetNewClosure()
 
             return [pscustomobject]@{
