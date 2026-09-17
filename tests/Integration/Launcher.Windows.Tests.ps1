@@ -251,6 +251,11 @@ exit $harnessExitCode
 
                 $startedUtc = [System.DateTime]::UtcNow
                 $process = Start-Process -FilePath $FilePath -ArgumentList $CommandArguments -WorkingDirectory $WorkingDirectory -PassThru -NoNewWindow -RedirectStandardInput $StandardInputPath -RedirectStandardOutput $standardOutputPath -RedirectStandardError $standardErrorPath -ErrorAction Stop
+                # Claim the cached OS handle while the child is still alive. Without
+                # it Windows PowerShell 5.1 cannot answer $process.ExitCode after the
+                # process has exited, so a real exit code (0 or 7) read as $null and
+                # every exit-code contract failed on a run that had visibly succeeded.
+                $null = $process.Handle
                 $completed = $process.WaitForExit($TimeoutSeconds * 1000)
                 $timedOut = $false
                 if (-not $completed) {
@@ -309,6 +314,34 @@ exit $harnessExitCode
             $record | Add-Member -MemberType NoteProperty -Name BoundArguments -Value @($boundArgumentList.ToArray())
             $record | Add-Member -MemberType NoteProperty -Name Values -Value $values
             return $record
+        }
+
+        function Get-HarnessSuppliedArgumentVector {
+            param(
+                [Parameter(Mandatory = $true)] $Record
+            )
+            # Element 0 of the raw command line is the host process name (for
+            # example powershell.exe), not a launcher-supplied argument, so it is
+            # never part of the pass-through contract.
+            $raw = @($Record.RawArguments)
+            if ($raw.Count -eq 0) { return @() }
+            return @($raw | Select-Object -Skip 1)
+        }
+
+        function New-HarnessCmdInvocation {
+            param(
+                [Parameter(Mandatory = $true)][string] $LauncherPath,
+                [string[]] $Arguments = @()
+            )
+            # cmd.exe strips the first and last quote character of the /c line when
+            # that line contains more than two quotes, which turned a quoted
+            # launcher path into 'Start-Recovery.bat"' and made the run fail with
+            # 'The filename, directory name, or volume label syntax is incorrect.'
+            # /s preserves the line exactly as written, so the quoted launcher path
+            # and every quoted caller argument survive unchanged.
+            $line = '"' + $LauncherPath + '"'
+            if ($Arguments.Count -gt 0) { $line = $line + ' ' + ($Arguments -join ' ') }
+            return @('/d', '/s', '/c', ('"' + $line + '"'))
         }
 
         function Compare-HarnessArgumentVector {
@@ -397,7 +430,7 @@ exit $harnessExitCode
             if (-not [string]::IsNullOrEmpty($script:LauncherHarnessSkipReason)) { Set-ItResult -Skipped -Because $script:LauncherHarnessSkipReason; return }
 
             $recordPath = Join-Path -Path $script:Harness.ScratchDirectory -ChildPath 'record-location.txt'
-            $run = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments @('/d', '/c', ('"' + $script:Harness.LauncherPath + '"'), '-DryRun', '-NoPause') -WorkingDirectory $script:Harness.ForeignDirectory -StandardInputPath $script:Harness.StandardInputPath -ScratchDirectory $script:Harness.ScratchDirectory -FileNamePrefix 'location' -TimeoutSeconds 60 -RecordPath $recordPath -EntryPointExitCode 0
+            $run = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments (New-HarnessCmdInvocation -LauncherPath $script:Harness.LauncherPath -Arguments @('-DryRun', '-NoPause')) -WorkingDirectory $script:Harness.ForeignDirectory -StandardInputPath $script:Harness.StandardInputPath -ScratchDirectory $script:Harness.ScratchDirectory -FileNamePrefix 'location' -TimeoutSeconds 60 -RecordPath $recordPath -EntryPointExitCode 0
 
             $run.TimedOut | Should -BeFalse -Because ('the launcher run must terminate: ' + (Get-HarnessRunDescription -Run $run))
             (Test-Path -LiteralPath $recordPath -PathType Leaf) | Should -BeTrue -Because ('the entry point next to the launcher must be located through %~dp0 even though the working directory is ' + $script:Harness.ForeignDirectory + ': ' + (Get-HarnessRunDescription -Run $run))
@@ -419,14 +452,14 @@ exit $harnessExitCode
 
             $recordPath = Join-Path -Path $script:Harness.ScratchDirectory -ChildPath 'record-arguments.txt'
             $suppliedArguments = @('-DryRun', '-NoPause')
-            $run = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments (@('/d', '/c', ('"' + $script:Harness.LauncherPath + '"')) + $suppliedArguments) -WorkingDirectory $script:Harness.ForeignDirectory -StandardInputPath $script:Harness.StandardInputPath -ScratchDirectory $script:Harness.ScratchDirectory -FileNamePrefix 'arguments' -TimeoutSeconds 60 -RecordPath $recordPath -EntryPointExitCode 0
+            $run = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments (New-HarnessCmdInvocation -LauncherPath $script:Harness.LauncherPath -Arguments $suppliedArguments) -WorkingDirectory $script:Harness.ForeignDirectory -StandardInputPath $script:Harness.StandardInputPath -ScratchDirectory $script:Harness.ScratchDirectory -FileNamePrefix 'arguments' -TimeoutSeconds 60 -RecordPath $recordPath -EntryPointExitCode 0
 
             $run.TimedOut | Should -BeFalse -Because (Get-HarnessRunDescription -Run $run)
             (Test-Path -LiteralPath $recordPath -PathType Leaf) | Should -BeTrue -Because (Get-HarnessRunDescription -Run $run)
 
             $record = Read-HarnessRecord -Path $recordPath
             $expectedArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:Harness.EntryPointPath) + $suppliedArguments
-            $difference = Compare-HarnessArgumentVector -Actual $record.RawArguments -Expected $expectedArguments
+            $difference = Compare-HarnessArgumentVector -Actual (Get-HarnessSuppliedArgumentVector -Record $record) -Expected $expectedArguments
             $difference | Should -BeNullOrEmpty -Because 'the launcher must pass its own documented options and the caller argument sequence unchanged'
         }
 
@@ -437,14 +470,14 @@ exit $harnessExitCode
             $configPath = 'C:\Recovery Fixture\case config.json'
             $caseLabel = 'client one'
             $suppliedArguments = @('-DryRun', '-NoPause', '-ConfigPath', ('"' + $configPath + '"'), '-CaseLabel', ('"' + $caseLabel + '"'))
-            $run = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments (@('/d', '/c', ('"' + $script:Harness.LauncherPath + '"')) + $suppliedArguments) -WorkingDirectory $script:Harness.ForeignDirectory -StandardInputPath $script:Harness.StandardInputPath -ScratchDirectory $script:Harness.ScratchDirectory -FileNamePrefix 'quoted' -TimeoutSeconds 60 -RecordPath $recordPath -EntryPointExitCode 0
+            $run = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments (New-HarnessCmdInvocation -LauncherPath $script:Harness.LauncherPath -Arguments $suppliedArguments) -WorkingDirectory $script:Harness.ForeignDirectory -StandardInputPath $script:Harness.StandardInputPath -ScratchDirectory $script:Harness.ScratchDirectory -FileNamePrefix 'quoted' -TimeoutSeconds 60 -RecordPath $recordPath -EntryPointExitCode 0
 
             $run.TimedOut | Should -BeFalse -Because (Get-HarnessRunDescription -Run $run)
             (Test-Path -LiteralPath $recordPath -PathType Leaf) | Should -BeTrue -Because (Get-HarnessRunDescription -Run $run)
 
             $record = Read-HarnessRecord -Path $recordPath
             $expectedArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:Harness.EntryPointPath, '-DryRun', '-NoPause', '-ConfigPath', $configPath, '-CaseLabel', $caseLabel)
-            $difference = Compare-HarnessArgumentVector -Actual $record.RawArguments -Expected $expectedArguments
+            $difference = Compare-HarnessArgumentVector -Actual (Get-HarnessSuppliedArgumentVector -Record $record) -Expected $expectedArguments
             $difference | Should -BeNullOrEmpty -Because 'a quoted path or label must not be split into several arguments or re-quoted'
             $record.Values['configpath'] | Should -Be $configPath
             $record.Values['caselabel'] | Should -Be $caseLabel
@@ -454,7 +487,7 @@ exit $harnessExitCode
             if (-not [string]::IsNullOrEmpty($script:LauncherHarnessSkipReason)) { Set-ItResult -Skipped -Because $script:LauncherHarnessSkipReason; return }
 
             $recordPath = Join-Path -Path $script:Harness.ScratchDirectory -ChildPath 'record-nopause-option.txt'
-            $run = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments @('/d', '/c', ('"' + $script:Harness.LauncherPath + '"'), '-NoPause') -WorkingDirectory $script:Harness.ForeignDirectory -StandardInputPath $script:Harness.StandardInputPath -ScratchDirectory $script:Harness.ScratchDirectory -FileNamePrefix 'nopause-option' -TimeoutSeconds 30 -RecordPath $recordPath -EntryPointExitCode 0 -SetNoPauseVariable $false
+            $run = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments (New-HarnessCmdInvocation -LauncherPath $script:Harness.LauncherPath -Arguments @('-NoPause')) -WorkingDirectory $script:Harness.ForeignDirectory -StandardInputPath $script:Harness.StandardInputPath -ScratchDirectory $script:Harness.ScratchDirectory -FileNamePrefix 'nopause-option' -TimeoutSeconds 30 -RecordPath $recordPath -EntryPointExitCode 0 -SetNoPauseVariable $false
 
             $run.TimedOut | Should -BeFalse -Because ('-NoPause must suppress the closing prompt so an automated caller cannot block on a redirected console: ' + (Get-HarnessRunDescription -Run $run))
             $run.ExitCode | Should -Be 0 -Because (Get-HarnessRunDescription -Run $run)
@@ -464,7 +497,7 @@ exit $harnessExitCode
             if (-not [string]::IsNullOrEmpty($script:LauncherHarnessSkipReason)) { Set-ItResult -Skipped -Because $script:LauncherHarnessSkipReason; return }
 
             $recordPath = Join-Path -Path $script:Harness.ScratchDirectory -ChildPath 'record-nopause-variable.txt'
-            $run = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments @('/d', '/c', ('"' + $script:Harness.LauncherPath + '"'), '-DryRun') -WorkingDirectory $script:Harness.ForeignDirectory -StandardInputPath $script:Harness.StandardInputPath -ScratchDirectory $script:Harness.ScratchDirectory -FileNamePrefix 'nopause-variable' -TimeoutSeconds 30 -RecordPath $recordPath -EntryPointExitCode 0 -SetNoPauseVariable $true
+            $run = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments (New-HarnessCmdInvocation -LauncherPath $script:Harness.LauncherPath -Arguments @('-DryRun')) -WorkingDirectory $script:Harness.ForeignDirectory -StandardInputPath $script:Harness.StandardInputPath -ScratchDirectory $script:Harness.ScratchDirectory -FileNamePrefix 'nopause-variable' -TimeoutSeconds 30 -RecordPath $recordPath -EntryPointExitCode 0 -SetNoPauseVariable $true
 
             $run.TimedOut | Should -BeFalse -Because ('RECOVERY_NO_PAUSE=1 must suppress the closing prompt even without the -NoPause argument: ' + (Get-HarnessRunDescription -Run $run))
             $run.ExitCode | Should -Be 0 -Because (Get-HarnessRunDescription -Run $run)
@@ -474,7 +507,7 @@ exit $harnessExitCode
             if (-not [string]::IsNullOrEmpty($script:LauncherHarnessSkipReason)) { Set-ItResult -Skipped -Because $script:LauncherHarnessSkipReason; return }
 
             $recordPath = Join-Path -Path $script:Harness.ScratchDirectory -ChildPath 'record-exit.txt'
-            $run = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments @('/d', '/c', ('"' + $script:Harness.LauncherPath + '"'), '-DryRun', '-NoPause') -WorkingDirectory $script:Harness.ForeignDirectory -StandardInputPath $script:Harness.StandardInputPath -ScratchDirectory $script:Harness.ScratchDirectory -FileNamePrefix 'exit-propagation' -TimeoutSeconds 30 -RecordPath $recordPath -EntryPointExitCode 7
+            $run = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments (New-HarnessCmdInvocation -LauncherPath $script:Harness.LauncherPath -Arguments @('-DryRun', '-NoPause')) -WorkingDirectory $script:Harness.ForeignDirectory -StandardInputPath $script:Harness.StandardInputPath -ScratchDirectory $script:Harness.ScratchDirectory -FileNamePrefix 'exit-propagation' -TimeoutSeconds 30 -RecordPath $recordPath -EntryPointExitCode 7
 
             $run.TimedOut | Should -BeFalse -Because (Get-HarnessRunDescription -Run $run)
             $run.ExitCode | Should -Be 7 -Because ('exit /b must return the entry point code unchanged; ' + (Get-HarnessRunDescription -Run $run))
@@ -484,7 +517,7 @@ exit $harnessExitCode
             if (-not [string]::IsNullOrEmpty($script:LauncherHarnessSkipReason)) { Set-ItResult -Skipped -Because $script:LauncherHarnessSkipReason; return }
 
             $brokenHarness = New-LauncherHarness -Name 'launcher-harness-missing-entrypoint' -WithoutEntryPoint
-            $run = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments @('/d', '/c', ('"' + $brokenHarness.LauncherPath + '"'), '-DryRun', '-NoPause') -WorkingDirectory $brokenHarness.ForeignDirectory -StandardInputPath $brokenHarness.StandardInputPath -ScratchDirectory $brokenHarness.ScratchDirectory -FileNamePrefix 'missing-entrypoint' -TimeoutSeconds 30 -RecordPath '' -EntryPointExitCode 0
+            $run = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments (New-HarnessCmdInvocation -LauncherPath $brokenHarness.LauncherPath -Arguments @('-DryRun', '-NoPause')) -WorkingDirectory $brokenHarness.ForeignDirectory -StandardInputPath $brokenHarness.StandardInputPath -ScratchDirectory $brokenHarness.ScratchDirectory -FileNamePrefix 'missing-entrypoint' -TimeoutSeconds 30 -RecordPath '' -EntryPointExitCode 0
 
             $run.TimedOut | Should -BeFalse -Because (Get-HarnessRunDescription -Run $run)
             $run.ExitCode | Should -Not -Be 0 -Because ('a launch that cannot reach the entry point must not report success; ' + (Get-HarnessRunDescription -Run $run))
@@ -501,7 +534,7 @@ exit $harnessExitCode
             if (-not [string]::IsNullOrEmpty($script:LauncherHarnessSkipReason)) { Set-ItResult -Skipped -Because $script:LauncherHarnessSkipReason; return }
 
             $recordPath = Join-Path -Path $script:Harness.ScratchDirectory -ChildPath 'record-pause-observation.txt'
-            $run = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments @('/d', '/c', ('"' + $script:Harness.LauncherPath + '"'), '-DryRun') -WorkingDirectory $script:Harness.ForeignDirectory -StandardInputPath $script:Harness.StandardInputPath -ScratchDirectory $script:Harness.ScratchDirectory -FileNamePrefix 'pause-observation' -TimeoutSeconds 20 -RecordPath $recordPath -EntryPointExitCode 0 -SetNoPauseVariable $false
+            $run = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments (New-HarnessCmdInvocation -LauncherPath $script:Harness.LauncherPath -Arguments @('-DryRun')) -WorkingDirectory $script:Harness.ForeignDirectory -StandardInputPath $script:Harness.StandardInputPath -ScratchDirectory $script:Harness.ScratchDirectory -FileNamePrefix 'pause-observation' -TimeoutSeconds 20 -RecordPath $recordPath -EntryPointExitCode 0 -SetNoPauseVariable $false
 
             $observation = ''
             if ($run.TimedOut) {
@@ -543,7 +576,7 @@ exit $harnessExitCode
                 New-HarnessEmptyFile -Path $dryRunStandardInputPath
 
                 $dryRunArguments = @('-DryRun', '-NoPause')
-                $script:RepositoryLauncherRun = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments (@('/d', '/c', ('"' + $script:LauncherPath + '"')) + $dryRunArguments) -WorkingDirectory $script:DryRunForeignDirectory -StandardInputPath $dryRunStandardInputPath -ScratchDirectory $dryRunScratchDirectory -FileNamePrefix 'repository-launcher' -TimeoutSeconds 150 -RecordPath '' -EntryPointExitCode 0
+                $script:RepositoryLauncherRun = Invoke-HarnessCommand -FilePath $script:CmdExecutable -CommandArguments (New-HarnessCmdInvocation -LauncherPath $script:LauncherPath -Arguments $dryRunArguments) -WorkingDirectory $script:DryRunForeignDirectory -StandardInputPath $dryRunStandardInputPath -ScratchDirectory $dryRunScratchDirectory -FileNamePrefix 'repository-launcher' -TimeoutSeconds 150 -RecordPath '' -EntryPointExitCode 0
                 $script:RepositoryDirectRun = Invoke-HarnessCommand -FilePath $script:WindowsPowerShellExecutable -CommandArguments (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $script:EntryPointPath + '"')) + $dryRunArguments) -WorkingDirectory $script:RepositoryRoot -StandardInputPath $dryRunStandardInputPath -ScratchDirectory $dryRunScratchDirectory -FileNamePrefix 'repository-direct' -TimeoutSeconds 150 -RecordPath '' -EntryPointExitCode 0
             }
         }
