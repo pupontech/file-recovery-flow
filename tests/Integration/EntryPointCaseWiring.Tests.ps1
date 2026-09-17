@@ -143,4 +143,94 @@ Describe 'Entry point case creation wiring' {
         [string]$lock.JobId | Should -Be $expectedJobId
         [string]$lock.Owner | Should -Be ('RecoveryAutomation/' + $expectedJobId)
     }
+
+    It 're-proves the exact candidate folder before the claim marker can be written' {
+        $sourcePath = Join-Path -Path $TestDrive -ChildPath 'source-claim-stage'
+        $destinationPath = Join-Path -Path $TestDrive -ChildPath 'destination-claim-stage'
+        New-Item -ItemType Directory -Path $sourcePath -Force | Out-Null
+        New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null
+        $disks = @(
+            (New-CaseWiringDiskRecord -DiskNumber 4 -UniqueId 'STAGE-SOURCE-DISK' -Model 'Source' -SizeBytes 1000000)
+            (New-CaseWiringDiskRecord -DiskNumber 5 -UniqueId 'STAGE-DESTINATION-DISK' -Model 'Destination' -SizeBytes 2000000)
+        )
+        # The topology answers with the destination disk while the candidate folder
+        # does not exist yet, and starts reporting the source volume for that same
+        # path once it does. Only a proof taken again for that exact path,
+        # immediately before the claim marker is written, can refuse the write.
+        $state = @{ CandidateResolutions = 0; CandidatePaths = New-Object System.Collections.Generic.List[string] }
+        $diskProvider = @{
+            Name = 'CaseWiringClaimStageFixture'
+            GetDisks = {
+                param($request)
+                foreach ($disk in $disks) {
+                    if ([int]$disk.DiskNumber -eq [int]$request.DiskNumber) { return $disk }
+                }
+                return $null
+            }.GetNewClosure()
+            ResolvePath = {
+                param($request)
+                $path = [string]$request.Path
+                $isSource = ($path -eq [string]$sourcePath)
+                $isRoot = ($path -eq [string]$destinationPath)
+                $diskNumber = 5
+                if ($isSource) {
+                    $diskNumber = 4
+                }
+                elseif ($isRoot) {
+                    $diskNumber = 5
+                }
+                elseif ([System.IO.Directory]::Exists($path)) {
+                    $state.CandidateResolutions = $state.CandidateResolutions + 1
+                    $state.CandidatePaths.Add($path) | Out-Null
+                    $diskNumber = 4
+                }
+                else {
+                    $state.CandidateResolutions = $state.CandidateResolutions + 1
+                    $state.CandidatePaths.Add($path) | Out-Null
+                    $diskNumber = 5
+                }
+                return [pscustomobject]@{
+                    CanonicalPath = $path
+                    Exists = $true
+                    IsContainer = $true
+                    ReparseResolved = $true
+                    IsReparsePoint = $false
+                    MembersIncomplete = $false
+                    DiskNumber = $diskNumber
+                    PartitionNumber = 1
+                    VolumeGuid = if ($diskNumber -eq 4) { 'STAGE-SOURCE-VOLUME' } else { 'STAGE-DESTINATION-VOLUME' }
+                    VolumePath = if ($diskNumber -eq 4) { 'STAGE-SOURCE-VOLUME-PATH' } else { 'STAGE-DESTINATION-VOLUME-PATH' }
+                    DriveLetter = $null
+                }
+            }.GetNewClosure()
+            GetFreeSpace = {
+                param($request)
+                return [pscustomobject]@{ VolumeAvailableBytes = 1000000000; UserAvailableBytes = 1000000000 }
+            }.GetNewClosure()
+        }
+
+        $result = New-CaseWiringRun -DiskProvider $diskProvider -SourcePath $sourcePath `
+            -DestinationPath $destinationPath -ClientName 'Claim Stage Client'
+
+        $result.Success | Should -BeFalse
+        # The candidate folder is reported on the source volume once it exists, so
+        # the second proof refuses the claim even though the destination root was
+        # proven separate a moment earlier.
+        $result.ReasonCode | Should -Be 'SameVolume'
+        $result.ExitCode | Should -Be 5
+        $result.VendorLaunchAttempted | Should -BeFalse
+        # Four proofs of that same candidate path: the identity before the
+        # directory and the fresh resolution inside its separation check, then the
+        # same pair again immediately before the claim marker. The second pair is
+        # what refused the write.
+        $state.CandidateResolutions | Should -Be 4
+        @($state.CandidatePaths | Sort-Object -Unique).Count | Should -Be 1
+        [string]$state.CandidatePaths[3] | Should -Be $state.CandidatePaths[1]
+        ([System.IO.Directory]::GetFileSystemEntries($destinationPath)).Count | Should -Be 1
+        $candidateFolder = [string]$state.CandidatePaths[1]
+        @([System.IO.Directory]::GetFileSystemEntries($candidateFolder)).Count | Should -Be 0
+        (Test-Path -LiteralPath (Join-Path -Path $candidateFolder -ChildPath 'job-claim.json')) | Should -BeFalse
+        (Test-Path -LiteralPath (Join-Path -Path $candidateFolder -ChildPath 'job-state.json')) | Should -BeFalse
+        (Test-Path -LiteralPath (Join-Path -Path $candidateFolder -ChildPath 'events.jsonl')) | Should -BeFalse
+    }
 }
