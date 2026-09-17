@@ -259,6 +259,37 @@ BeforeAll {
         param([string]$SourceDiskNumber = '0', [string]$DestinationDiskNumber = '1')
         return [pscustomobject]@{ SourceDiskNumber = $SourceDiskNumber; DestinationDiskNumber = $DestinationDiskNumber }
     }
+
+    # Every log this file opens with a writer provider is tracked so the
+    # file-level AfterAll can release its handle. The case log is opened with
+    # FileShare.Read, and on Windows a still-open handle makes Pester's TestDrive
+    # cleanup fail with a file-lock error, so a leaked writer here is a real test
+    # defect rather than a cosmetic one.
+    $script:TrackedLogWriters = New-Object System.Collections.Generic.List[object]
+    function New-RecoveryLog {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyString()][object]$Path,
+            [Parameter(Mandatory = $true)][AllowEmptyString()][object]$JobId,
+            [object]$Writer = $null,
+            [object]$Clock = $null,
+            [switch]$Resume
+        )
+        $forward = @{}
+        foreach ($key in @($PSBoundParameters.Keys)) { $forward[$key] = $PSBoundParameters[$key] }
+        $result = RecoveryLogging\New-RecoveryLog @forward
+        if ($null -ne $result -and $result.Success -eq $true -and $null -ne $result.Writer) {
+            $script:TrackedLogWriters.Add($result.Writer) | Out-Null
+        }
+        return $result
+    }
+}
+
+AfterAll {
+    foreach ($writer in $script:TrackedLogWriters.ToArray()) {
+        try { [void](RecoveryLogging\Close-RecoveryLog -Writer $writer) } catch { }
+    }
+    $script:TrackedLogWriters.Clear()
 }
 
 Describe 'Disk provider selection and evidence (C-01)' {
@@ -2155,7 +2186,7 @@ Describe 'Module source contracts' {
         $stateExports = (Get-Module -Name JobState).ExportedFunctions.Keys | Sort-Object
 
         $expectedDisk = @('Get-PhysicalDiskIdentity', 'Get-RecoveryDestinationSpace', 'Get-RecoveryVolumeInventory', 'New-RecoveryJobFolder', 'Resolve-RecoveryDiskProvider', 'Resolve-RecoveryPathIdentity', 'Convert-RecoveryName', 'Select-DestinationFolder', 'Test-DestinationSafety' | Sort-Object)
-        $expectedLog = @('Sync-RecoveryLog', 'New-RecoveryLog', 'Test-RecoveryLog', 'Write-RecoveryLogEntry' | Sort-Object)
+        $expectedLog = @('Sync-RecoveryLog', 'Close-RecoveryLog', 'New-RecoveryLog', 'Test-RecoveryLog', 'Write-RecoveryLogEntry' | Sort-Object)
         $expectedState = @('Lock-RecoveryJob', 'Get-RecoveryResumeDecision', 'New-RecoveryJobState', 'Read-RecoveryJobState', 'Set-RecoveryState', 'Test-RecoveryStateTransition', 'Write-RecoveryJobState' | Sort-Object)
 
         ($diskExports -join '|') | Should -Be ($expectedDisk -join '|')
