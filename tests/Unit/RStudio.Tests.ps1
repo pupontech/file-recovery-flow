@@ -69,7 +69,11 @@ Describe 'R-Studio handoff and technician UI' {
             [CmdletBinding()]
             param([Parameter(Mandatory = $true)][string]$Name)
 
-            return @($global:RecoveryTestCalls[$Name])
+            # The comma keeps the array from being unrolled on return. Without it a
+            # single recorded call was returned as a bare scalar, and '.Count' on a
+            # scalar answers 1 on PowerShell 7 but $null on Windows PowerShell 5.1,
+            # so thirteen call-count contracts failed only on the Windows lane.
+            return ,@($global:RecoveryTestCalls[$Name])
         }
 
         function New-VerifiedRStudioExecutable {
