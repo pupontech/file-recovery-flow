@@ -58,6 +58,9 @@ function Test-LiteralApplicationPath {
     if ($Path.Contains('"')) {
         return $false
     }
+    if ($Path -match '[<>|]') {
+        return $false
+    }
     foreach ($character in $Path.ToCharArray()) {
         if ([char]::IsControl($character)) {
             return $false

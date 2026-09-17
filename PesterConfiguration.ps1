@@ -133,7 +133,17 @@ switch ($Lane) {
         $selectedTags = $liveTagNameList
     }
     'All' {
-        $candidatePaths = @($testsRoot)
+        # Explicit non-live directories instead of the tests root. Under the pinned
+        # Pester 5.x the directory exclusion in Run.ExcludePath did not prevent
+        # discovery of tests/Live, so the live vendor files were only removed by the
+        # tag filter and appeared as 29 phantom NotRun tests on the Windows lane.
+        # Naming the non-live directories resolves the live set by path on every
+        # supported Pester major.
+        $candidatePaths = @(
+            [System.IO.Path]::Combine($testsRoot, 'Unit')
+            [System.IO.Path]::Combine($testsRoot, 'Integration')
+            $staticContractFile
+        )
     }
 }
 

@@ -479,10 +479,13 @@ function Get-RecoveryPhysicalDiskNumbers {
 function Test-RecoveryMembershipIncomplete {
     # Membership is only complete when the provider states it as the literal
     # Boolean false. An absent statement is not a claim, and a non Boolean
-    # statement is never read as completeness.
+    # statement is never read as completeness: an absent field used to be read as
+    # "complete", which made a record that never mentioned membership authorize a
+    # destination comparison, so absence now fails closed like the sibling guards
+    # for Resolved, Exists, and the reparse pair.
     param([object]$Record)
     $value = Get-RecoveryMemberValue -Object $Record -Name 'MembersIncomplete'
-    if ($null -eq $value) { return $false }
+    if ($null -eq $value) { return $true }
     if ($value -is [bool]) { return [bool]$value }
     return $true
 }

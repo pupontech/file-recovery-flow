@@ -386,8 +386,8 @@ Describe 'RecoveryAutomation bounded entrypoint' {
         Set-Content -LiteralPath $rStudioPath -Value 'fixture' -Encoding ASCII
 
         $disks = @(
-            [pscustomobject]@{ DiskNumber = 4; UniqueId = 'SOURCE-DISK-FORWARD'; UniqueIdFormat = 'WWN'; SerialNumber = 'SOURCE-SERIAL-FORWARD'; Model = 'Source'; SizeBytes = 1000000 }
-            [pscustomobject]@{ DiskNumber = 5; UniqueId = 'DESTINATION-DISK-FORWARD'; UniqueIdFormat = 'WWN'; SerialNumber = 'DESTINATION-SERIAL-FORWARD'; Model = 'Destination'; SizeBytes = 2000000 }
+            [pscustomobject]@{ DiskNumber = 4; UniqueId = 'SOURCE-DISK-FORWARD'; UniqueIdFormat = 'WWN'; SerialNumber = 'SOURCE-SERIAL-FORWARD'; Model = 'Source'; SizeBytes = 1000000; PartitionStyle = 2; MembersIncomplete = $false }
+            [pscustomobject]@{ DiskNumber = 5; UniqueId = 'DESTINATION-DISK-FORWARD'; UniqueIdFormat = 'WWN'; SerialNumber = 'DESTINATION-SERIAL-FORWARD'; Model = 'Destination'; SizeBytes = 2000000; PartitionStyle = 2; MembersIncomplete = $false }
         )
         $diskProvider = @{
             Name = 'IntegrationFixtureForward'

@@ -74,6 +74,20 @@ function Get-RecoveryAutomationElevationArgumentLine {
     if ([string]::IsNullOrWhiteSpace($ScriptPath)) {
         throw 'The entry point path is required for an elevated relaunch.'
     }
+    # A value containing a double quote cannot be quoted for the child process: the
+    # child would re-parse the remainder as extra switches. Such a value is refused
+    # instead of being forwarded, because forwarding it would either fail or change
+    # the meaning of the elevated run.
+    foreach ($candidate in @(
+            [pscustomobject]@{ Name = 'ScriptPath'; Value = $ScriptPath }
+            [pscustomobject]@{ Name = 'ConfigPath'; Value = $ConfigPath }
+            [pscustomobject]@{ Name = 'SourcePath'; Value = $SourcePath }
+            [pscustomobject]@{ Name = 'DestinationPath'; Value = $DestinationPath }
+            [pscustomobject]@{ Name = 'ClientName'; Value = $ClientName })) {
+        if (-not [string]::IsNullOrEmpty([string]$candidate.Value) -and ([string]$candidate.Value).Contains('"')) {
+            throw ('The value supplied for ' + $candidate.Name + ' contains a double quote, which cannot be forwarded through the elevated relaunch.')
+        }
+    }
     # The elevated child is a new process, so every documented technician input
     # is re-declared here. A value that is not re-passed is silently lost for the
     # whole elevated run, which is why each one is quoted and forwarded explicitly.
@@ -128,8 +142,23 @@ function Invoke-RecoveryAutomationSelfElevation {
         [string]$DestinationPath = '',
         [string]$ClientName = '',
         [switch]$NoPause,
-        [switch]$DryRun
+        [switch]$DryRun,
+        [switch]$SkipElevation
     )
+
+    # A dry run starts no vendor process and touches no recovery media, so it is not
+    # elevated: prompting for UAC to run a read-only diagnostic would train the
+    # technician to approve elevation when nothing needs it. Everything that reaches
+    # a vendor application or a disk still requires real elevation.
+    if ($SkipElevation) {
+        return [pscustomobject]@{
+            ShouldExit = $false
+            Success = $true
+            ExitCode = 0
+            ReasonCode = $null
+            Message = $null
+        }
+    }
 
     if ($env:OS -ne 'Windows_NT' -or (Test-RecoveryAutomationHostElevated)) {
         return [pscustomobject]@{
@@ -168,11 +197,17 @@ function Invoke-RecoveryAutomationSelfElevation {
         }
     }
     catch {
+        $reason = 'ElevationDeclined'
+        if ($_.Exception.Message -like '*cannot be forwarded through the elevated relaunch*') {
+            # A value the relaunch cannot quote safely is a refusal, not a declined
+            # UAC prompt: the technician has to change the input.
+            $reason = 'ElevationInputRefused'
+        }
         return [pscustomobject]@{
             ShouldExit = $true
             Success = $false
             ExitCode = 3
-            ReasonCode = 'ElevationDeclined'
+            ReasonCode = $reason
             Message = ('Administrator elevation was not granted. No vendor or recovery-media operation was attempted. ' + $_.Exception.Message)
         }
     }
@@ -631,20 +666,26 @@ function New-RecoveryAutomationWindowsDiskProvider {
             $evidence.PartitionCount = $evidence.PartitionCount + 1
             $gptType = & $FieldReader $partition 'GptType'
             $mbrType = & $FieldReader $partition 'MbrType'
-            if ($null -eq $gptType -and $null -eq $mbrType) {
+            # A blank string is not a statement: a partition that publishes an
+            # empty GptType and no MbrType used to count as a proven non-LDM
+            # partition, which made an unknown type look like a known one.
+            $gptStated = -not [string]::IsNullOrWhiteSpace([string]$gptType)
+            $mbrText = [string]$mbrType
+            $mbrStated = -not [string]::IsNullOrWhiteSpace($mbrText)
+            if (-not $gptStated -and -not $mbrStated) {
                 $evidence.Stated = $false
                 $evidence.Reason = 'PartitionTypeUnstated'
                 return $evidence
             }
-            if ($null -ne $gptType) {
+            if ($gptStated) {
                 $gptText = ([string]$gptType).Trim().Trim('{', '}').ToLowerInvariant()
                 if ($gptText -eq '5808c8aa-7e8f-42e0-85d2-e1e90434cfb3' -or $gptText -eq 'af9b60a0-1431-4f62-bc68-3311714a69ad') {
                     $evidence.HasLdm = $true
                 }
             }
-            if ($null -ne $mbrType) {
+            if ($mbrStated) {
                 $parsedMbr = -1
-                if ([int]::TryParse([string]$mbrType, [ref]$parsedMbr)) {
+                if ([int]::TryParse($mbrText, [ref]$parsedMbr)) {
                     if ($parsedMbr -eq 0x42) { $evidence.HasLdm = $true }
                 }
                 else {
@@ -873,10 +914,7 @@ function New-RecoveryAutomationWindowsDiskProvider {
                                 $partitionEvidence.Stated = $false
                                 $partitionEvidence.Reason = 'PartitionCountMismatch'
                             }
-                            elseif ($partitionEvidence.PartitionCount -eq 0 -and $declaredCount -eq 0) {
-                                $partitionEvidence.Stated = $true
-                                $partitionEvidence.Reason = 'NoPartitionsDeclared'
-                            }
+
                         }
                         else {
                             $partitionEvidence.Stated = $false
@@ -1524,72 +1562,81 @@ function Test-RecoveryAutomationFreshSafety {
     $space = DiskDetection\Get-RecoveryDestinationSpace -Path $DestinationPath -Provider $DiskProvider -ReserveBytes $ReserveBytes
     $selection = $SourceSelection
     if ($null -eq $selection -and $null -ne $PreviousProtection) { $selection = $PreviousProtection.Raw }
+    # This function is invoked through ${function:Test-RecoveryAutomationFreshSafety}
+    # .GetNewClosure(), which gives its body its own dynamic module: a call to a
+    # script-scope function such as Test-RecoveryAutomationSourceProtection fails
+    # with CommandNotFoundException here, which is why the protection classification
+    # is resolved by a captured script block instead of by calling the shared
+    # function. The classification below must stay identical to the shared function,
+    # including EvidenceKind, which is what separates an operator attestation from a
+    # measured read-only observation in the record that authorizes the handoff.
+    # Self-contained on purpose: this body runs inside a closure, so it cannot call
+    # any script-scope helper (Get-RecoveryAutomationValue, Test-RecoveryAutomationBoolean)
+    # or the shared Test-RecoveryAutomationSourceProtection. Property access is
+    # written out, and the classification must stay identical to the shared
+    # function, including EvidenceKind, which is what separates an operator
+    # attestation from a measured read-only observation in the record that
+    # authorizes the handoff.
     $protectionResolver = {
         param([string]$Path, [AllowNull()][object]$Selection, [scriptblock]$Provider)
-        $selectionNames = @('ReadOnlyVerified', 'WriteBlocked', 'SourceProtected', 'HardwareWriteBlocked')
-        foreach ($name in $selectionNames) {
-            $value = $null
-            if ($null -ne $Selection) {
-                if ($Selection -is [System.Collections.IDictionary]) {
-                    if ($Selection.Contains($name)) { $value = $Selection[$name] }
+
+        $readValue = {
+            param([object]$Object, [string[]]$Names)
+            foreach ($name in $Names) {
+                if ($null -eq $Object) { return $null }
+                if ($Object -is [System.Collections.IDictionary]) {
+                    if ($Object.Contains($name)) { return $Object[$name] }
+                    continue
                 }
-                else {
-                    $property = $Selection.PSObject.Properties[$name]
-                    if ($null -ne $property) { $value = $property.Value }
-                }
+                $property = $Object.PSObject.Properties[$name]
+                if ($null -ne $property) { return $property.Value }
             }
-            $verified = $false
-            if ($value -is [bool]) { $verified = [bool]$value }
-            else {
-                [void][bool]::TryParse(([string]$value), [ref]$verified)
-            }
-            if ($verified) {
-                return [pscustomobject]@{ Verified = $true; Evidence = 'Source selection included read-only/write-blocker evidence.'; ReasonCode = $null; Raw = $Selection }
+            return $null
+        }
+        $readBoolean = {
+            param([object]$Value)
+            if ($null -eq $Value) { return $false }
+            if ($Value -is [bool]) { return [bool]$Value }
+            $parsed = $false
+            if ([bool]::TryParse(([string]$Value), [ref]$parsed)) { return $parsed }
+            return $false
+        }
+
+        foreach ($name in @('ReadOnlyVerified', 'WriteBlocked', 'SourceProtected', 'HardwareWriteBlocked')) {
+            if (& $readBoolean (& $readValue $Selection @($name))) {
+                return [pscustomobject]@{ Verified = $true; Evidence = 'Source selection included read-only/write-blocker evidence.'; EvidenceKind = 'SelectionDeclared'; ReasonCode = $null; Raw = $Selection }
             }
         }
         if ($null -eq $Provider) {
-            return [pscustomobject]@{ Verified = $false; Evidence = 'No read-only or write-blocker evidence was supplied.'; ReasonCode = 'SourceProtectionUnverified'; Raw = $null }
+            return [pscustomobject]@{ Verified = $false; Evidence = 'No read-only or write-blocker evidence was supplied.'; EvidenceKind = 'Unspecified'; ReasonCode = 'SourceProtectionUnverified'; Raw = $null }
         }
         try {
             $raw = & $Provider ([pscustomobject]@{ Purpose = 'SourceProtection'; Path = $Path; Selection = $Selection })
         }
         catch {
-            return [pscustomobject]@{ Verified = $false; Evidence = $_.Exception.Message; ReasonCode = 'SourceProtectionCheckFailed'; Raw = $null }
+            return [pscustomobject]@{ Verified = $false; Evidence = $_.Exception.Message; EvidenceKind = 'Unspecified'; ReasonCode = 'SourceProtectionCheckFailed'; Raw = $null }
         }
         if ($raw -is [bool]) {
-            return [pscustomobject]@{ Verified = [bool]$raw; Evidence = 'Source protection provider Boolean result.'; ReasonCode = if ($raw) { $null } else { 'SourceProtectionUnverified' }; Raw = $raw }
+            return [pscustomobject]@{ Verified = [bool]$raw; Evidence = 'Source protection provider Boolean result.'; EvidenceKind = 'ProviderDeclared'; ReasonCode = if ($raw) { $null } else { 'SourceProtectionUnverified' }; Raw = $raw }
         }
-        $verifiedValue = $null
-        foreach ($name in @('Verified', 'ReadOnlyVerified', 'WriteBlocked', 'SourceProtected', 'HardwareWriteBlocked')) {
-            if ($null -eq $raw) { break }
-            if ($raw -is [System.Collections.IDictionary]) {
-                if ($raw.Contains($name)) { $verifiedValue = $raw[$name]; break }
-            }
-            else {
-                $property = $raw.PSObject.Properties[$name]
-                if ($null -ne $property) { $verifiedValue = $property.Value; break }
-            }
+        $verified = & $readValue $raw @('Verified', 'ReadOnlyVerified', 'WriteBlocked', 'SourceProtected', 'HardwareWriteBlocked')
+        $evidence = & $readValue $raw @('Evidence', 'Message', 'Reason')
+        $reportedKind = & $readValue $raw @('EvidenceKind', 'AttestationKind', 'Kind')
+        $evidenceKind = 'ProviderDeclared'
+        if ($null -ne $reportedKind -and -not [string]::IsNullOrWhiteSpace([string]$reportedKind)) {
+            $kindText = ([string]$reportedKind).ToLowerInvariant()
+            if ($kindText.Contains('attest')) { $evidenceKind = 'OperatorAttestation' }
+            elseif ($kindText.Contains('measured')) { $evidenceKind = 'MeasuredState' }
+            else { $evidenceKind = [string]$reportedKind }
         }
-        $evidence = $null
-        foreach ($name in @('Evidence', 'Message', 'Reason')) {
-            if ($null -eq $raw) { break }
-            if ($raw -is [System.Collections.IDictionary]) {
-                if ($raw.Contains($name)) { $evidence = $raw[$name]; break }
-            }
-            else {
-                $property = $raw.PSObject.Properties[$name]
-                if ($null -ne $property) { $evidence = $property.Value; break }
-            }
-        }
-        $isVerified = $false
-        if ($verifiedValue -is [bool]) { $isVerified = [bool]$verifiedValue }
-        else { [void][bool]::TryParse(([string]$verifiedValue), [ref]$isVerified) }
-        return [pscustomobject]@{ Verified = $isVerified; Evidence = $evidence; ReasonCode = if ($isVerified) { $null } else { 'SourceProtectionUnverified' }; Raw = $raw }
+        $isVerified = & $readBoolean $verified
+        return [pscustomobject]@{ Verified = $isVerified; Evidence = $evidence; EvidenceKind = $evidenceKind; ReasonCode = if ($isVerified) { $null } else { 'SourceProtectionUnverified' }; Raw = $raw }
     }.GetNewClosure()
     if ($RequireFreshProtectionProvider -and $null -eq $SourceProtectionProvider) {
         $protection = [pscustomobject]@{
             Verified = $false
             Evidence = 'A fresh source-protection provider is required before an external vendor action.'
+            EvidenceKind = 'Unspecified'
             ReasonCode = 'SourceProtectionUnverified'
             Raw = $null
         }
@@ -3038,14 +3085,9 @@ function Invoke-RecoveryAutomation {
 
 if ($MyInvocation.InvocationName -ne '.') {
     # The front door forwards every documented technician input. A value that is
-    # not forwarded is lost for the whole run, so this list is explicit instead
-    # of a silent parameter subset.
-    $forwarded = @{}
-    foreach ($forwardName in @('SourcePath', 'DestinationPath', 'ClientName')) {
-        if ($PSBoundParameters.ContainsKey($forwardName)) { $forwarded[$forwardName] = $PSBoundParameters[$forwardName] }
-    }
+    # not forwarded is lost for the whole run.
     $elevationLaunch = Invoke-RecoveryAutomationSelfElevation -ScriptPath $PSCommandPath `
-        -ConfigPath $RecoveryConfigPath -NoPause:$NoPause -DryRun:$DryRun `
+        -ConfigPath $RecoveryConfigPath -NoPause:$NoPause -DryRun:$DryRun -SkipElevation:$DryRun `
         -SourcePath $SourcePath -DestinationPath $DestinationPath -ClientName $ClientName
     if ($elevationLaunch.ShouldExit) {
         if ($elevationLaunch.Success) {

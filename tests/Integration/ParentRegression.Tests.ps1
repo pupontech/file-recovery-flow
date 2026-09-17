@@ -119,6 +119,28 @@ $line = Get-RecoveryAutomationElevationArgumentLine -ScriptPath 'C:\case\Recover
         ([regex]::Matches($source, '-LogPath \$Case\.LogPath')).Count | Should -Be 0
     }
 
+    It 'refuses an input the elevated relaunch cannot quote safely' {
+        $result = Invoke-EntryPointScript -Body @'
+$refused = $false
+$line = $null
+try { $line = Get-RecoveryAutomationElevationArgumentLine -ScriptPath 'C:\case\RecoveryAutomation.ps1' -ClientName ('Evil' + [char]34 + ' -DryRun') } catch { $refused = $true }
+$skipped = Invoke-RecoveryAutomationSelfElevation -ScriptPath 'C:\case\RecoveryAutomation.ps1' -DryRun -SkipElevation
+$entrySource = [System.IO.File]::ReadAllText($script:EntryPointPath)
+[pscustomobject]@{
+    LineRefused = [bool]$refused
+    LinePresent = ($null -ne $line)
+    SkipProceeds = [bool](-not $skipped.ShouldExit)
+    DeclaresRefusal = [bool]($entrySource -match 'ElevationInputRefused')
+    DryRunSkipsElevation = [bool]($entrySource -match 'SkipElevation:\$DryRun')
+}
+'@
+        $result.LineRefused | Should -BeTrue
+        $result.LinePresent | Should -BeFalse
+        $result.SkipProceeds | Should -BeTrue -Because 'a dry run starts no vendor process and must not raise a UAC prompt'
+        $result.DeclaresRefusal | Should -BeTrue
+        $result.DryRunSkipsElevation | Should -BeTrue
+    }
+
     It 'relaunches UAC elevation with the running PowerShell host through the host resolver' {
         $result = Invoke-EntryPointScript -Body @'
 $entrySource = [System.IO.File]::ReadAllText($script:EntryPointPath)
@@ -143,7 +165,7 @@ Describe 'Production storage provider accepts the documented Windows disk view' 
         function Invoke-EntryPointScript {
             param([string]$Body)
             $scriptPath = [System.IO.Path]::Combine($PSScriptRoot, ('parent-regression-' + [guid]::NewGuid().ToString('N') + '.ps1'))
-            $prefix = '. "' + $script:EntryPoint + '"' + [char]10
+            $prefix = '$script:EntryPointPath = "' + $script:EntryPoint + '"' + [char]10 + '. "' + $script:EntryPoint + '"' + [char]10
             [System.IO.File]::WriteAllText($scriptPath, ($prefix + $Body), (New-Object System.Text.UTF8Encoding($false)))
             try {
                 $command = "'###JSON###'; (& '" + $scriptPath + "' | ConvertTo-Json -Depth 12 -Compress)"
@@ -261,6 +283,35 @@ $absent = & $absentProvider.ResolvePath @{ Path = 'D:\case' }
         $result.AbsentMembersIncomplete | Should -BeTrue
         $result.AbsentMembersEvidence | Should -Be 'DriveLetterOnlyMembership'
     }
+    It 'refuses an absent or blank topology statement instead of reading it as proven' {
+        $result = Invoke-EntryPointScript -Body @'
+$silent = [pscustomobject]@{ CanonicalPath = 'D:\case'; Exists = $true; IsContainer = $true; IsReparsePoint = $false; ReparseResolved = $true; PhysicalDiskNumbers = @(1); DiskNumber = 1 }
+Import-Module -Name ([System.IO.Path]::Combine([System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($script:EntryPointPath), 'modules'), 'DiskDetection.psm1')) -Force
+$diskModule = Get-Module -Name DiskDetection
+$absentVerdict = & $diskModule { param($record) Test-RecoveryMembershipIncomplete -Record $record } $silent
+$statedCompleteVerdict = & $diskModule { param($record) Test-RecoveryMembershipIncomplete -Record $record } ([pscustomobject]@{ MembersIncomplete = $false })
+$statedIncompleteVerdict = & $diskModule { param($record) Test-RecoveryMembershipIncomplete -Record $record } ([pscustomobject]@{ MembersIncomplete = $true })
+
+$blankDisk = [pscustomobject]@{
+    Number = 0; UniqueId = 'FIXTURE-UNIQUE-ID'; UniqueIdFormat = 3; SerialNumber = 'FIXTURE-SERIAL'
+    Model = 'Fixture Model'; Size = 500107862016; BusType = 17; PartitionStyle = 2; NumberOfPartitions = 1
+}
+$blankPartitions = @([pscustomobject]@{ DiskNumber = 0; PartitionNumber = 1; GptType = '' })
+$blankProvider = New-RecoveryAutomationWindowsDiskProvider -DiskQuery { param($request) $blankDisk } -PartitionQuery { param($request) $blankPartitions }
+$blankRecord = @(& $blankProvider.GetDisks @{ DiskNumber = 0 })[0]
+
+[pscustomobject]@{
+    AbsentIsIncomplete = [bool]$absentVerdict
+    StatedCompleteIsIncomplete = [bool]$statedCompleteVerdict
+    StatedIncompleteIsIncomplete = [bool]$statedIncompleteVerdict
+    BlankTypeIncomplete = [bool]$blankRecord.MembersIncomplete
+}
+'@
+        $result.AbsentIsIncomplete | Should -BeTrue -Because 'a record that never states membership has proven nothing'
+        $result.StatedCompleteIsIncomplete | Should -BeFalse
+        $result.StatedIncompleteIsIncomplete | Should -BeTrue
+        $result.BlankTypeIncomplete | Should -BeTrue -Because 'a blank partition type string is not a statement'
+    }
 }
 
 Describe 'Path guards refuse instead of throwing' {
@@ -343,6 +394,7 @@ Describe 'A live event log stays readable while its writer is open' {
         $script:ModulesRoot = [System.IO.Path]::Combine($script:RepositoryRoot, 'modules')
 
         function Invoke-LogLivenessProbe {
+            param([string]$CustomBody = '')
             $moduleRoot = $script:ModulesRoot
             $scriptPath = [System.IO.Path]::Combine($PSScriptRoot, ('parent-log-' + [guid]::NewGuid().ToString('N') + '.ps1'))
             $body = 'Import-Module -Name "' + $moduleRoot + '\RecoveryLogging.psm1" -Force' + [char]10 + @'
@@ -379,6 +431,9 @@ try { [System.IO.Directory]::Delete($root, $true); $removed = $true } catch { $f
     Removable = [bool]$removed
 }
 '@
+            if (-not [string]::IsNullOrWhiteSpace($CustomBody)) {
+                $body = 'Import-Module -Name "' + $moduleRoot + '\RecoveryLogging.psm1" -Force' + [char]10 + $CustomBody
+            }
             [System.IO.File]::WriteAllText($scriptPath, $body, (New-Object System.Text.UTF8Encoding($false)))
             try {
                 $command = "'###JSON###'; (& '" + $scriptPath + "' | ConvertTo-Json -Depth 12 -Compress)"
@@ -392,6 +447,31 @@ try { [System.IO.Directory]::Delete($root, $true); $removed = $true } catch { $f
                 if ([System.IO.File]::Exists($scriptPath)) { [System.IO.File]::Delete($scriptPath) }
             }
         }
+    }
+
+    It 'refuses a same-length rewrite of the record tail' {
+        $result = Invoke-LogLivenessProbe -CustomBody @'
+$root = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ('recovery-tamper-' + [guid]::NewGuid().ToString('N')))
+$null = [System.IO.Directory]::CreateDirectory($root)
+$logPath = [System.IO.Path]::Combine($root, 'events.jsonl')
+$log = New-RecoveryLog -Path $logPath -JobId 'LiveLogClient_20260917-000000'
+$null = Write-RecoveryLogEntry -Writer $log.Writer -Entry ([pscustomobject]@{ JobId = 'LiveLogClient_20260917-000000'; State = 'CASE_READY'; Stage = 'PREFLIGHT'; AttemptId = 'tamper-001'; EventType = 'CaseReady'; Result = 'Recorded' })
+$bytes = [System.IO.File]::ReadAllBytes($logPath)
+$before = $bytes.Length
+if ($bytes.Length -gt 0) { $bytes[$bytes.Length - 1] = [byte]11 }
+[System.IO.File]::WriteAllBytes($logPath, $bytes)
+$after = ([System.IO.FileInfo]$logPath).Length
+$attempt = Write-RecoveryLogEntry -Writer $log.Writer -Entry ([pscustomobject]@{ JobId = 'LiveLogClient_20260917-000000'; State = 'CASE_READY'; Stage = 'PREFLIGHT'; AttemptId = 'tamper-002'; EventType = 'CaseReady'; Result = 'Recorded' })
+try { [System.IO.Directory]::Delete($root, $true) } catch { }
+[pscustomobject]@{
+    SameLength = ($before -eq $after)
+    AttemptSuccess = [bool]$attempt.Success
+    AttemptReason = [string]$attempt.ReasonCode
+}
+'@
+        $result.SameLength | Should -BeTrue -Because 'the probe must keep the byte length identical to test the same-length guard'
+        $result.AttemptSuccess | Should -BeFalse
+        $result.AttemptReason | Should -Be 'LogAppendFailed'
     }
 
     It 'validates and reads the case record while the writer is still live' {

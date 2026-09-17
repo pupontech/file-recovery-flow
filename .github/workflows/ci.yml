@@ -85,6 +85,10 @@ jobs:
         with:
           name: pester-static-linux
           path: .test-results/
+          # .test-results is a hidden directory and actions/upload-artifact
+          # defaults to excluding hidden files, so every report was silently
+          # dropped and the repository had no artifact at all.
+          include-hidden-files: true
           if-no-files-found: ignore
 
   test-windows:
@@ -212,6 +216,8 @@ jobs:
         with:
           name: pester-${{ matrix.os }}
           path: .test-results/
+          # See the static lane: hidden files are excluded by default.
+          include-hidden-files: true
           if-no-files-found: ignore
 
   compat-analyze:

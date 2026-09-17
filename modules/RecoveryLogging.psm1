@@ -254,6 +254,55 @@ function Read-RecoveryLogBytes {
     }
 }
 
+function Get-RecoveryLogTailHash {
+    # Hash of the trailing window of the case record. The window is bounded so the
+    # check stays cheap while the case runs, and it is compared before every append:
+    # a changed length is caught by the offset, and a same-length rewrite is caught
+    # here. The residual limitation (a rewrite confined to bytes outside the window
+    # with an unchanged length) is recorded in the operator guide.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$Length = 256
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    if (-not [System.IO.File]::Exists($Path)) { return '' }
+    if ($Length -le 0) { $Length = 256 }
+    $stream = $null
+    try {
+        $info = New-Object System.IO.FileInfo($Path)
+        $count = [int]$info.Length
+        if ($count -gt $Length) { $count = $Length }
+        $stream = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        if ($count -gt 0) { [void]$stream.Seek(-1 * [int64]$count, [System.IO.SeekOrigin]::End) }
+        $buffer = New-Object byte[] $count
+        $read = 0
+        while ($read -lt $count) {
+            $chunk = $stream.Read($buffer, $read, $count - $read)
+            if ($chunk -le 0) { break }
+            $read = $read + $chunk
+        }
+        if ($read -lt $count) { return '' }
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $hash = $sha.ComputeHash($buffer)
+        }
+        finally {
+            $sha.Dispose()
+        }
+        $builder = New-Object System.Text.StringBuilder
+        foreach ($byte in $hash) { [void]$builder.Append($byte.ToString('x2', [System.Globalization.CultureInfo]::InvariantCulture)) }
+        return $builder.ToString()
+    }
+    catch {
+        return ''
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
 function Get-RecoveryDefaultLogWriterProvider {
     $provider = @{}
     $provider.Name = 'AsciiJsonlFileWriter'
@@ -295,6 +344,7 @@ function Get-RecoveryDefaultLogWriterProvider {
         catch {
             return [pscustomobject]@{ Success = $false; ReasonCode = 'LogOpenFailed'; Message = $_.Exception.Message }
         }
+        $tailLength = 256
         return [pscustomobject]@{
             Success = $true
             ReasonCode = $null
@@ -303,6 +353,10 @@ function Get-RecoveryDefaultLogWriterProvider {
             Path = $path
             Mode = $mode
             Offset = $offset
+            # The trailing window is hashed after every append, so a rewrite that
+            # keeps the byte length but changes the record is refused as well.
+            TailLength = $tailLength
+            TailHash = Get-RecoveryLogTailHash -Path $path -Length $tailLength
         }
     }
     $provider.Append = {
@@ -325,6 +379,13 @@ function Get-RecoveryDefaultLogWriterProvider {
                 # instead of writing into a history it no longer owns.
                 return [pscustomobject]@{ Success = $false; ReasonCode = 'LogAppendFailed'; Message = 'The log length changed since the previous append; the record is not append-only.' }
             }
+            $tailHash = Get-RecoveryLogTailHash -Path $path -Length ([int]$providerHandle.TailLength)
+            if ($tailHash -ne [string]$providerHandle.TailHash) {
+                # The length is unchanged but the tail is not the tail that was
+                # written. A same-length rewrite would otherwise be accepted and the
+                # case would keep appending on top of edited history.
+                return [pscustomobject]@{ Success = $false; ReasonCode = 'LogAppendFailed'; Message = 'The log tail does not match the last append; the record was changed out of band.' }
+            }
             $stream = New-Object System.IO.FileStream($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
             $stream.Write($bytes, 0, $bytes.Length)
             $stream.Flush($true)
@@ -336,6 +397,7 @@ function Get-RecoveryDefaultLogWriterProvider {
             if ($null -ne $stream) { $stream.Dispose() }
         }
         $providerHandle.Offset = $expectedOffset + $bytes.Length
+        $providerHandle.TailHash = Get-RecoveryLogTailHash -Path $path -Length ([int]$providerHandle.TailLength)
         return [pscustomobject]@{ Success = $true; ReasonCode = $null; Message = $null }
     }
     $provider.Flush = {
@@ -698,11 +760,11 @@ function Close-RecoveryLog {
         [Parameter(Mandatory = $true)][AllowNull()][object]$Writer
     )
 
-    # Releases the log file handle. The workflow opens the case log with
-    # FileShare.Read, so on Windows the file stays locked until this close runs:
-    # Pester TestDrive cleanup, job-folder moves, and any exclusive reader need
-    # the handle gone. Closing an already closed log is not an error (cleanup
-    # paths may run more than once), and a refused close is always reported.
+    # Releases the logical writer. Each event is appended and flushed on its own,
+    # so no file handle is held between events and this close ends the writer's
+    # state rather than unlocking a file. Closing an already closed log is not an
+    # error (cleanup paths may run more than once), and a refused close is always
+    # reported.
     $result = [pscustomobject]@{
         Success    = $false
         Path       = $null
