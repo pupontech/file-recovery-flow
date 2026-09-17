@@ -351,6 +351,103 @@ Describe 'Resume entry point' {
         $calls | Should -HaveCount 0
     }
 
+    It 'records that an existing case is ready when the decision routes it' {
+        $case = New-ResumeCase -StateName 'PREFLIGHT_PASSED'
+        $provider = New-ResumeDiskProvider
+        $recorder = New-ResumeRunRecorder
+        $interaction = { param($request) return 'Stop' }
+
+        $result = Invoke-RecoveryAutomation -ConfigPath $script:ConfigPath -NoPause -ResumeJobPath $case.Folder `
+            -DiskProvider $provider -RuntimeProvider { return @{ Compatible = $true; Evidence = 'ResumeFixture' } } `
+            -ElevationProvider { return $true } -InteractionProvider $interaction `
+            -VendorProcessRunner $recorder.Refuse -Clock (New-ResumeClock)
+
+        $result.Success | Should -BeFalse
+        $result.ReasonCode | Should -Be 'ManualGatePending'
+        $result.CurrentState | Should -Be 'CASE_READY'
+        $recorder.Calls | Should -HaveCount 0
+        $stateOnDisk = ([System.IO.File]::ReadAllText($case.Paths.StatePath, (New-Object System.Text.UTF8Encoding($false))) | ConvertFrom-Json)
+        $stateOnDisk.State | Should -Be 'CASE_READY'
+    }
+
+    It 'advances to the launch gate only on a recorded operator decision' {
+        $case = New-ResumeCase -StateName 'CASE_READY'
+        $provider = New-ResumeDiskProvider
+        $recorder = New-ResumeRunRecorder
+        $gates = New-Object System.Collections.Generic.List[string]
+        $interaction = {
+            param($request)
+            $gates.Add([string]$request.GateId) | Out-Null
+            return 'Continue'
+        }.GetNewClosure()
+
+        $result = Invoke-RecoveryAutomation -ConfigPath $script:ConfigPath -NoPause -ResumeJobPath $case.Folder `
+            -DiskProvider $provider -RuntimeProvider { return @{ Compatible = $true; Evidence = 'ResumeFixture' } } `
+            -ElevationProvider { return $true } -InteractionProvider $interaction `
+            -VendorProcessRunner $recorder.Refuse -Clock (New-ResumeClock)
+
+        $result.Success | Should -BeFalse
+        $result.ReasonCode | Should -Be 'ManualGatePending'
+        $result.CurrentState | Should -Be 'SHORT_SCAN_RUNNING'
+        # The launch gate is documented and recorded; no vendor process is started.
+        $gates | Should -HaveCount 1
+        $gates[0] | Should -Be 'G-04'
+        $recorder.Calls | Should -HaveCount 0
+        $stateOnDisk = ([System.IO.File]::ReadAllText($case.Paths.StatePath, (New-Object System.Text.UTF8Encoding($false))) | ConvertFrom-Json)
+        $stateOnDisk.State | Should -Be 'SHORT_SCAN_RUNNING'
+        $stateOnDisk.AttemptId | Should -Be ($case.Leaf + '-short-scan-001')
+        $logText = [System.IO.File]::ReadAllText($case.Paths.LogPath, (New-Object System.Text.UTF8Encoding($false)))
+        $logText | Should -Match 'OperatorDecision'
+    }
+
+    It 'leaves the state alone when the launch gate is not continued' {
+        $case = New-ResumeCase -StateName 'CASE_READY'
+        $provider = New-ResumeDiskProvider
+        $recorder = New-ResumeRunRecorder
+        $interaction = { param($request) return 'Stop' }
+
+        $result = Invoke-RecoveryAutomation -ConfigPath $script:ConfigPath -NoPause -ResumeJobPath $case.Folder `
+            -DiskProvider $provider -RuntimeProvider { return @{ Compatible = $true; Evidence = 'ResumeFixture' } } `
+            -ElevationProvider { return $true } -InteractionProvider $interaction `
+            -VendorProcessRunner $recorder.Refuse -Clock (New-ResumeClock)
+
+        $result.Success | Should -BeFalse
+        $result.ReasonCode | Should -Be 'ManualGatePending'
+        $result.CurrentState | Should -Be 'CASE_READY'
+        $recorder.Calls | Should -HaveCount 0
+        # The refused gate is recorded, and the state does not advance: no stage is
+        # authorized, no attempt id is invented, and the case stays resumable.
+        $stateOnDisk = ([System.IO.File]::ReadAllText($case.Paths.StatePath, (New-Object System.Text.UTF8Encoding($false))) | ConvertFrom-Json)
+        $stateOnDisk.State | Should -Be 'CASE_READY'
+        $stateOnDisk.AttemptId | Should -BeNullOrEmpty
+        @($stateOnDisk.GateDecisions).Count | Should -Be 1
+        $logText = [System.IO.File]::ReadAllText($case.Paths.LogPath, (New-Object System.Text.UTF8Encoding($false)))
+        $logText | Should -Match 'OperatorDecision'
+        # The refused gate may name the state it would have authorized, but no event
+        # is recorded in that state.
+        $logText | Should -Not -Match '"State":"SHORT_SCAN_RUNNING"'
+        $lock = ([System.IO.File]::ReadAllText((Join-Path -Path $case.Folder -ChildPath 'job.lock'), (New-Object System.Text.UTF8Encoding($false))) | ConvertFrom-Json)
+        $read = Read-RecoveryJobState -Path $case.Paths.StatePath -Lock ([pscustomobject]@{ Acquired = $true; LockPath = (Join-Path -Path $case.Folder -ChildPath 'job.lock'); Owner = [string]$lock.Owner }) `
+            -Clock (New-ResumeClock) -ExpectedOwner ('RecoveryAutomation/' + $case.Leaf)
+        $read.Success | Should -BeTrue
+        $read.State.State | Should -Be 'CASE_READY'
+    }
+
+    It 'refuses a resume that also carries new-case inputs' {
+        $case = New-ResumeCase -StateName 'SHORT_RECOVERY_VERIFIED'
+        $provider = New-ResumeDiskProvider
+
+        $result = Invoke-RecoveryAutomation -ConfigPath $script:ConfigPath -NoPause -ResumeJobPath $case.Folder `
+            -ClientName 'Someone Else' `
+            -DiskProvider $provider -RuntimeProvider { return @{ Compatible = $true; Evidence = 'ResumeFixture' } } `
+            -ElevationProvider { return $true } -Clock (New-ResumeClock)
+
+        $result.Success | Should -BeFalse
+        $result.Mode | Should -Be 'Resume'
+        $result.ReasonCode | Should -Be 'ResumeInputConflict'
+        (Test-Path -LiteralPath (Join-Path -Path $case.Folder -ChildPath 'job.lock')) | Should -BeFalse
+    }
+
     It 'forwards the resume path through the elevated relaunch argument line' {
         $line = Get-RecoveryAutomationElevationArgumentLine -ScriptPath 'C:\case\RecoveryAutomation.ps1' `
             -ResumeJobPath 'D:\cases\Client_20260916-070000' -NoPause

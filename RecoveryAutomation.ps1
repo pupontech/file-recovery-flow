@@ -3092,7 +3092,18 @@ function Invoke-RecoveryAutomation {
         if (-not [string]::IsNullOrWhiteSpace([string]$ResumeJobPath)) {
             # Resume is an explicit entry, never a fallback: it happens after the
             # elevation and runtime preflight and before any source selection, so a
-            # resume can never create, select, or claim a case of its own.
+            # resume can never create, select, or claim a case of its own. A resume
+            # that also carries new-case inputs is refused instead of silently
+            # ignoring them.
+            foreach ($conflicting in @('SourcePath', 'DestinationPath', 'ClientName')) {
+                if (-not $PSBoundParameters.ContainsKey($conflicting)) { continue }
+                if ([string]::IsNullOrWhiteSpace([string]$PSBoundParameters[$conflicting])) { continue }
+                return New-RecoveryAutomationResult -Success $false -ExitCode 5 -Mode 'Resume' `
+                    -ReasonCode 'ResumeInputConflict' `
+                    -Message ('A resume accepts the case folder path only; ' + $conflicting + ' belongs to a new case.') `
+                    -ConfigurationResult $configurationResult -VendorLaunchAttempted $false -RecoveryMediaTouched $false `
+                    -Runtime $runtime
+            }
             $resumeDiskProvider = $DiskProvider
             if ($null -eq $resumeDiskProvider) { $resumeDiskProvider = New-RecoveryAutomationWindowsDiskProvider }
             return Invoke-RecoveryAutomationResume -ResumePath $ResumeJobPath -DiskProvider $resumeDiskProvider `
