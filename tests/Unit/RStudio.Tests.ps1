@@ -714,7 +714,9 @@ Describe 'R-Studio handoff and technician UI' {
             $result = Start-RStudioHandoff -State (New-HandoffState) `
                 -Executable (New-VerifiedRStudioExecutable) `
                 -ProcessRunner $runner
-            $result.Decision | Should -Be 'Failed'
+            # A possibly-started but uncertain launch is a handoff review, never
+            # an ordinary failure: R-Studio may be running and must not be retried.
+            $result.Decision | Should -Be 'HandoffReview'
             $result.ReasonCode | Should -Be 'ProcessResultUnverified'
             $result.Launched | Should -BeFalse
         }
@@ -732,7 +734,7 @@ Describe 'R-Studio handoff and technician UI' {
             $result = Start-RStudioHandoff -State (New-HandoffState) `
                 -Executable (New-VerifiedRStudioExecutable) `
                 -ProcessRunner $runner
-            $result.Decision | Should -Be 'Failed'
+            $result.Decision | Should -Be 'HandoffReview'
             $result.ReasonCode | Should -Be 'ProcessResultUnverified'
             $result.Launched | Should -BeFalse
         }
@@ -750,7 +752,7 @@ Describe 'R-Studio handoff and technician UI' {
             $result = Start-RStudioHandoff -State (New-HandoffState) `
                 -Executable (New-VerifiedRStudioExecutable) `
                 -ProcessRunner $runner
-            $result.Decision | Should -Be 'Failed'
+            $result.Decision | Should -Be 'HandoffReview'
             $result.ReasonCode | Should -Be 'ProcessPathMismatch'
             $result.Launched | Should -BeFalse
         }
@@ -767,7 +769,7 @@ Describe 'R-Studio handoff and technician UI' {
             $result = Start-RStudioHandoff -State (New-HandoffState) `
                 -Executable (New-VerifiedRStudioExecutable) `
                 -ProcessRunner $runner
-            $result.Decision | Should -Be 'Failed'
+            $result.Decision | Should -Be 'HandoffReview'
             $result.ReasonCode | Should -Be 'ProcessPathMissing'
             $result.Launched | Should -BeFalse
         }
@@ -784,7 +786,7 @@ Describe 'R-Studio handoff and technician UI' {
             $result = Start-RStudioHandoff -State (New-HandoffState) `
                 -Executable (New-VerifiedRStudioExecutable) `
                 -ProcessRunner $runner
-            $result.Decision | Should -Be 'Failed'
+            $result.Decision | Should -Be 'HandoffReview'
             $result.ReasonCode | Should -Be 'ProcessStartTimeMissing'
             $result.Launched | Should -BeFalse
         }
@@ -853,7 +855,7 @@ Describe 'R-Studio handoff and technician UI' {
             $result = Start-RStudioHandoff -State (New-HandoffState) `
                 -Executable (New-VerifiedRStudioExecutable) `
                 -ProcessRunner $runner
-            $result.Decision | Should -Be 'Failed'
+            $result.Decision | Should -Be 'HandoffReview'
             $result.ReasonCode | Should -Be 'ProcessLaunchFailed'
             $result.Launched | Should -BeFalse
             $result.MainPanelGate | Should -BeNullOrEmpty
@@ -870,7 +872,7 @@ Describe 'R-Studio handoff and technician UI' {
                 $result = Start-RStudioHandoff -State (New-HandoffState) `
                     -Executable (New-VerifiedRStudioExecutable) `
                     -ProcessRunner $runner
-                $result.Decision | Should -Be 'Failed'
+                $result.Decision | Should -Be 'HandoffReview'
                 $result.ReasonCode | Should -Be 'ProcessIdentityMissing'
                 $result.Launched | Should -BeFalse
             }
@@ -951,6 +953,196 @@ Describe 'R-Studio handoff and technician UI' {
             $calls = Get-VendorCalls -Name 'ProcessRunner'
             @($calls[0].Arguments) | Should -Not -Contain $clientFolder
             @($calls[0].Arguments).Count | Should -Be 3
+        }
+    }
+
+    Context 'handoff launch outcome verification' -Tag 'Phase2' {
+
+        BeforeAll {
+            $null = Import-RepoModule -Root $repoRoot -Name 'RStudio.psm1'
+        }
+
+        BeforeEach {
+            New-VendorCallLog
+        }
+
+        It 'treats a runner result with no liveness statement as a handoff review' {
+            $runner = {
+                param($Request)
+                [void]$global:RecoveryTestCalls['ProcessRunner'].Add($Request)
+                return [pscustomobject]@{
+                    Success      = $true
+                    ProcessId    = 4321
+                    Path         = $Request.ExecutablePath
+                    StartTimeUtc = [datetime]::UtcNow
+                }
+            }
+
+            $result = Start-RStudioHandoff -State (New-HandoffState) `
+                -Executable (New-VerifiedRStudioExecutable) `
+                -ProcessRunner $runner
+
+            $result.Decision | Should -Be 'HandoffReview'
+            $result.ReasonCode | Should -Be 'ProcessLivenessUnstated'
+            $result.Launched | Should -BeFalse
+            $result.ProcessIdentity.ProcessId | Should -Be 4321
+            $result.MainPanelGate | Should -BeNullOrEmpty
+        }
+
+        It 'treats a runner result that states the process already exited as a handoff review' {
+            $runner = {
+                param($Request)
+                return [pscustomobject]@{
+                    Success      = $true
+                    ProcessId    = 4321
+                    Path         = $Request.ExecutablePath
+                    StartTimeUtc = [datetime]::UtcNow
+                    HasExited    = $true
+                }
+            }
+
+            $result = Start-RStudioHandoff -State (New-HandoffState) `
+                -Executable (New-VerifiedRStudioExecutable) `
+                -ProcessRunner $runner
+
+            $result.Decision | Should -Be 'HandoffReview'
+            $result.ReasonCode | Should -Be 'ProcessNotAlive'
+            $result.Launched | Should -BeFalse
+            $result.ProcessIdentity.ProcessId | Should -Be 4321
+        }
+
+        It 'treats contradictory liveness statements as a handoff review' {
+            $runner = {
+                param($Request)
+                return [pscustomobject]@{
+                    Success      = $true
+                    ProcessId    = 4321
+                    Path         = $Request.ExecutablePath
+                    StartTimeUtc = [datetime]::UtcNow
+                    HasExited    = $false
+                    Alive        = $false
+                }
+            }
+
+            $result = Start-RStudioHandoff -State (New-HandoffState) `
+                -Executable (New-VerifiedRStudioExecutable) `
+                -ProcessRunner $runner
+
+            $result.Decision | Should -Be 'HandoffReview'
+            $result.ReasonCode | Should -Be 'ProcessLivenessContradictory'
+            $result.Launched | Should -BeFalse
+        }
+
+        It 'treats a non-Boolean liveness statement as a handoff review' {
+            $runner = {
+                param($Request)
+                return [pscustomobject]@{
+                    Success      = $true
+                    ProcessId    = 4321
+                    Path         = $Request.ExecutablePath
+                    StartTimeUtc = [datetime]::UtcNow
+                    HasExited    = 'no'
+                }
+            }
+
+            $result = Start-RStudioHandoff -State (New-HandoffState) `
+                -Executable (New-VerifiedRStudioExecutable) `
+                -ProcessRunner $runner
+
+            $result.Decision | Should -Be 'HandoffReview'
+            $result.ReasonCode | Should -Be 'ProcessLivenessUnclear'
+            $result.Launched | Should -BeFalse
+        }
+
+        It 'normalizes multiple runner results to a handoff review without claiming a launch' {
+            $runner = {
+                param($Request)
+                return @(
+                    [pscustomobject]@{ Success = $true; ProcessId = 4321; Path = $Request.ExecutablePath; StartTimeUtc = [datetime]::UtcNow; HasExited = $false }
+                    [pscustomobject]@{ Success = $true; ProcessId = 4322; Path = $Request.ExecutablePath; StartTimeUtc = [datetime]::UtcNow; HasExited = $false }
+                )
+            }
+
+            $result = Start-RStudioHandoff -State (New-HandoffState) `
+                -Executable (New-VerifiedRStudioExecutable) `
+                -ProcessRunner $runner
+
+            $result.Decision | Should -Be 'HandoffReview'
+            $result.ReasonCode | Should -Be 'AmbiguousProcessIdentity'
+            $result.Launched | Should -BeFalse
+            $result.ProcessIdentity | Should -BeNullOrEmpty
+            $result.MainPanelGate | Should -BeNullOrEmpty
+        }
+
+        It 'normalizes an empty runner result set to a handoff review' {
+            $runner = {
+                param($Request)
+                [void]$Request
+            }
+
+            $result = Start-RStudioHandoff -State (New-HandoffState) `
+                -Executable (New-VerifiedRStudioExecutable) `
+                -ProcessRunner $runner
+
+            $result.Decision | Should -Be 'HandoffReview'
+            $result.ReasonCode | Should -Be 'ProcessIdentityMissing'
+            $result.Launched | Should -BeFalse
+            $result.ProcessIdentity | Should -BeNullOrEmpty
+        }
+
+        It 'accepts an explicit live statement without an exit flag as a launched handoff' {
+            $runner = {
+                param($Request)
+                return [pscustomobject]@{
+                    Success      = $true
+                    ProcessId    = 4321
+                    Path         = $Request.ExecutablePath
+                    StartTimeUtc = [datetime]::UtcNow
+                    Alive        = $true
+                }
+            }
+
+            $result = Start-RStudioHandoff -State (New-HandoffState) `
+                -Executable (New-VerifiedRStudioExecutable) `
+                -ProcessRunner $runner
+
+            $result.Decision | Should -Be 'HandoffLaunched'
+            $result.Launched | Should -BeTrue
+            $result.MainPanelGate | Should -Not -BeNullOrEmpty
+        }
+
+        It 'allows no retry, no forced close, and no analysis claim on a handoff review' {
+            $runner = {
+                param($Request)
+                [void]$global:RecoveryTestCalls['ProcessRunner'].Add($Request)
+                return [pscustomobject]@{
+                    Success      = $true
+                    ProcessId    = 4321
+                    Path         = $Request.ExecutablePath
+                    StartTimeUtc = [datetime]::UtcNow
+                }
+            }
+            $activation = {
+                param($ProcessIdentity)
+                [void]$global:RecoveryTestCalls['ActivationProvider'].Add($ProcessIdentity)
+                return [pscustomobject]@{ Result = 'Activated'; ReasonCode = $null }
+            }
+
+            $result = Start-RStudioHandoff -State (New-HandoffState) `
+                -Executable (New-VerifiedRStudioExecutable) `
+                -ProcessRunner $runner `
+                -ActivationProvider $activation
+
+            $result.Decision | Should -Be 'HandoffReview'
+            $result.RetryAllowed | Should -BeFalse
+            $result.ForcedCloseAllowed | Should -BeFalse
+            $result.RequiresHandoffReview | Should -BeTrue
+            $result.VendorProcessPossible | Should -BeTrue
+            $result.AnalysisInvoked | Should -BeFalse
+            $result.CompletionClaimed | Should -BeFalse
+            $result.Activation | Should -BeNullOrEmpty
+            (Get-VendorCalls -Name 'ProcessRunner').Count | Should -Be 1
+            (Get-VendorCalls -Name 'ActivationProvider').Count | Should -Be 0
         }
     }
 
