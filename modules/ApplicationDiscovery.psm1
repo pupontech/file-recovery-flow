@@ -55,17 +55,27 @@ function Test-LiteralApplicationPath {
     if ($Path -match '[\*\?\[\]]') {
         return $false
     }
+    if ($Path.Contains('"')) {
+        return $false
+    }
     foreach ($character in $Path.ToCharArray()) {
         if ([char]::IsControl($character)) {
             return $false
         }
     }
-    if (-not [System.IO.Path]::IsPathRooted($Path) -and
-        $Path -notmatch '^[A-Za-z]:[\\/]' -and
-        $Path -notmatch '^\\\\[^\\]+\\') {
+    # The explicit Windows forms are checked first, and IsPathRooted runs inside a
+    # guard: on Windows it throws ArgumentException ('Illegal characters in path')
+    # for a path the checks above cannot enumerate, and an application identity
+    # refusal must never surface as an unhandled exception.
+    if ($Path -match '^[A-Za-z]:[\\/]') { return $true }
+    if ($Path -match '^\\\\[^\\]+\\') { return $true }
+    try {
+        if ([System.IO.Path]::IsPathRooted($Path)) { return $true }
+    }
+    catch {
         return $false
     }
-    return $true
+    return $false
 }
 
 function New-ApplicationIdentityObject {

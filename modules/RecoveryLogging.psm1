@@ -209,6 +209,51 @@ function ConvertTo-RecoveryAsciiJson {
     return $builder.ToString()
 }
 
+function Read-RecoveryLogBytes {
+    # Reads the case log while its writer may still hold it open.
+    #
+    # The writer keeps one append handle for the life of the case, so the log is
+    # readable only when both handles agree. File.ReadAllBytes asks for
+    # FileShare.Read, which refuses another handle that has write access, so on
+    # Windows it fails with a sharing violation as long as the case is running;
+    # the same call silently succeeds on Linux, where .NET does not enforce
+    # sharing. This helper asks for FileShare.ReadWrite instead, so the case
+    # record stays readable while the case is live, and it still refuses to
+    # invent content: any failure returns $null and the caller fails closed.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][object]$Path)
+
+    $pathText = ([string]$Path).Trim()
+    if ($pathText.Length -eq 0) { return $null }
+    $stream = $null
+    try {
+        $stream = New-Object System.IO.FileStream($pathText, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    }
+    catch {
+        # No writer is holding the file: fall back to the plain read, so a closed
+        # or absent log behaves exactly as it did before.
+        try { return [System.IO.File]::ReadAllBytes($pathText) } catch { return $null }
+    }
+    try {
+        $length = [int]$stream.Length
+        $buffer = New-Object byte[] $length
+        $read = 0
+        while ($read -lt $length) {
+            $chunk = $stream.Read($buffer, $read, $length - $read)
+            if ($chunk -le 0) { break }
+            $read = $read + $chunk
+        }
+        if ($read -lt $length) { return $null }
+        return $buffer
+    }
+    catch {
+        return $null
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
 function Get-RecoveryDefaultLogWriterProvider {
     $provider = @{}
     $provider.Name = 'AsciiJsonlFileWriter'
@@ -222,43 +267,92 @@ function Get-RecoveryDefaultLogWriterProvider {
         if (-not [System.IO.Directory]::Exists($directory)) {
             return [pscustomobject]@{ Success = $false; ReasonCode = 'LogOpenFailed'; Message = 'The log directory does not exist.' }
         }
-        $mode = [System.IO.FileMode]::CreateNew
-        if ([string]$request.Mode -eq 'Append') { $mode = [System.IO.FileMode]::Append }
+        $mode = 'CreateNew'
+        if ([string]$request.Mode -eq 'Append') { $mode = 'Append' }
+        # The log is not held open between events.
+        #
+        # A held append handle keeps every other reader out on Windows: .NET
+        # readers ask for FileShare.Read, which refuses an open writer, so the
+        # case record could not be read while the case ran (event log validation,
+        # resume binding, and any technician editor all failed with a sharing
+        # violation), and a temporary directory holding the file could not be
+        # removed. Each event is instead appended and flushed on its own, so the
+        # case record stays readable and removable at every moment while
+        # append-only integrity is still enforced by the recorded offset below.
+        $offset = 0
         try {
-            $stream = [System.IO.File]::Open($path, $mode, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+            if ($mode -eq 'CreateNew') {
+                $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+                $stream.Dispose()
+            }
+            elseif (-not [System.IO.File]::Exists($path)) {
+                return [pscustomobject]@{ Success = $false; ReasonCode = 'LogOpenFailed'; Message = 'The log to append to does not exist.' }
+            }
+            else {
+                $offset = [int](New-Object System.IO.FileInfo($path)).Length
+            }
         }
         catch {
             return [pscustomobject]@{ Success = $false; ReasonCode = 'LogOpenFailed'; Message = $_.Exception.Message }
         }
-        return [pscustomobject]@{ Success = $true; ReasonCode = $null; Message = $null; Stream = $stream }
+        return [pscustomobject]@{
+            Success = $true
+            ReasonCode = $null
+            Message = $null
+            Stream = $null
+            Path = $path
+            Mode = $mode
+            Offset = $offset
+        }
     }
     $provider.Append = {
         param($request)
         $handle = $request.Handle
-        $stream = $null
-        if ($null -ne $handle) { $stream = $handle.ProviderHandle.Stream }
-        if ($null -eq $stream) {
-            return [pscustomobject]@{ Success = $false; ReasonCode = 'LogAppendFailed'; Message = 'The log stream is not open.' }
+        $providerHandle = $null
+        if ($null -ne $handle) { $providerHandle = $handle.ProviderHandle }
+        if ($null -eq $providerHandle) {
+            return [pscustomobject]@{ Success = $false; ReasonCode = 'LogAppendFailed'; Message = 'The log is not open.' }
         }
+        $path = [string]$providerHandle.Path
+        $expectedOffset = [int]$providerHandle.Offset
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes([string]$request.Text)
+        $stream = $null
         try {
-            $bytes = [System.Text.Encoding]::ASCII.GetBytes([string]$request.Text)
+            $info = New-Object System.IO.FileInfo($path)
+            if ($info.Length -ne $expectedOffset) {
+                # The file changed since the last append (truncated, replaced, or
+                # written by another process). An append-only record must refuse
+                # instead of writing into a history it no longer owns.
+                return [pscustomobject]@{ Success = $false; ReasonCode = 'LogAppendFailed'; Message = 'The log length changed since the previous append; the record is not append-only.' }
+            }
+            $stream = New-Object System.IO.FileStream($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
             $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
         }
         catch {
             return [pscustomobject]@{ Success = $false; ReasonCode = 'LogAppendFailed'; Message = $_.Exception.Message }
         }
+        finally {
+            if ($null -ne $stream) { $stream.Dispose() }
+        }
+        $providerHandle.Offset = $expectedOffset + $bytes.Length
         return [pscustomobject]@{ Success = $true; ReasonCode = $null; Message = $null }
     }
     $provider.Flush = {
         param($request)
         $handle = $request.Handle
-        $stream = $null
-        if ($null -ne $handle) { $stream = $handle.ProviderHandle.Stream }
-        if ($null -eq $stream) {
-            return [pscustomobject]@{ Success = $false; ReasonCode = 'LogFlushFailed'; Message = 'The log stream is not open.' }
+        $providerHandle = $null
+        if ($null -ne $handle) { $providerHandle = $handle.ProviderHandle }
+        if ($null -eq $providerHandle) {
+            return [pscustomobject]@{ Success = $false; ReasonCode = 'LogFlushFailed'; Message = 'The log is not open.' }
         }
+        # Every append already flushed to disk, so there is no buffered state to
+        # push. The operation stays a real check: an unreadable record is a
+        # refusal rather than a claimed durable log.
         try {
-            $stream.Flush($true)
+            if (-not [System.IO.File]::Exists([string]$providerHandle.Path)) {
+                return [pscustomobject]@{ Success = $false; ReasonCode = 'LogFlushFailed'; Message = 'The log file is missing.' }
+            }
         }
         catch {
             return [pscustomobject]@{ Success = $false; ReasonCode = 'LogFlushFailed'; Message = $_.Exception.Message }
@@ -268,13 +362,14 @@ function Get-RecoveryDefaultLogWriterProvider {
     $provider.Close = {
         param($request)
         $handle = $request.Handle
-        $stream = $null
-        if ($null -ne $handle) { $stream = $handle.ProviderHandle.Stream }
-        if ($null -eq $stream) {
+        if ($null -eq $handle) {
             return [pscustomobject]@{ Success = $true; ReasonCode = $null; Message = $null }
         }
         try {
-            $stream.Dispose()
+            $stream = $null
+            if ($null -ne $handle.ProviderHandle) { $stream = $handle.ProviderHandle.Stream }
+            if ($null -ne $stream) { $stream.Dispose() }
+            $handle.IsOpen = $false
         }
         catch {
             return [pscustomobject]@{ Success = $false; ReasonCode = 'LogCloseFailed'; Message = $_.Exception.Message }
@@ -308,7 +403,13 @@ function Test-RecoveryLog {
         $result.ReasonCode = 'LogNotFound'
         return $result
     }
-    $bytes = [System.IO.File]::ReadAllBytes($pathText)
+    $bytes = Read-RecoveryLogBytes -Path $pathText
+    if ($null -eq $bytes) {
+        # The log exists but could not be read. That is a refusal, never a valid
+        # empty log: a caller must not treat an unreadable case record as proof.
+        $result.ReasonCode = 'LogUnreadable'
+        return $result
+    }
     if ($bytes.Length -eq 0) {
         $result.IsValid = $true
         $result.ReasonCode = $null

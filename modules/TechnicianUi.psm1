@@ -152,11 +152,36 @@ function Test-TUAbsolutePath {
     param([AllowNull()][string]$Path)
 
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
-    if ([System.IO.Path]::IsPathRooted($Path)) { return $true }
+    # Character validation must run before any System.IO.Path call: on Windows
+    # IsPathRooted throws ArgumentException ('Illegal characters in path') for a
+    # path containing a quote, and a refusal must never surface as an unhandled
+    # exception.
+    if (Test-TUPathIllegalCharacter -Path $Path) { return $false }
+    try {
+        if ([System.IO.Path]::IsPathRooted($Path)) { return $true }
+    }
+    catch {
+        return $false
+    }
     # Windows drive-letter and UNC forms are not recognized by IsPathRooted on a
     # non-Windows host, so they are recognized explicitly here.
     if ($Path -match '^[A-Za-z]:[\\/]') { return $true }
     if ($Path -match '^\\\\[^\\]+\\') { return $true }
+    return $false
+}
+
+function Test-TUPathIllegalCharacter {
+    [CmdletBinding()]
+    param([AllowNull()][string]$Path)
+
+    if ([string]::IsNullOrEmpty($Path)) { return $false }
+    foreach ($character in $Path.ToCharArray()) {
+        if ([char]::IsControl($character)) { return $true }
+    }
+    if ($Path.Contains('"')) { return $true }
+    if ($Path.Contains('*')) { return $true }
+    if ($Path.Contains('?')) { return $true }
+    if ($Path -match '[<>|]') { return $true }
     return $false
 }
 

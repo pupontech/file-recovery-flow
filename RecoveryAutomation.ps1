@@ -1,4 +1,4 @@
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [Alias('ConfigPath')]
     [string]$RecoveryConfigPath = '',
@@ -64,6 +64,9 @@ function Get-RecoveryAutomationElevationArgumentLine {
     param(
         [Parameter(Mandatory = $true)][string]$ScriptPath,
         [string]$ConfigPath = '',
+        [string]$SourcePath = '',
+        [string]$DestinationPath = '',
+        [string]$ClientName = '',
         [switch]$NoPause,
         [switch]$DryRun
     )
@@ -71,13 +74,49 @@ function Get-RecoveryAutomationElevationArgumentLine {
     if ([string]::IsNullOrWhiteSpace($ScriptPath)) {
         throw 'The entry point path is required for an elevated relaunch.'
     }
+    # The elevated child is a new process, so every documented technician input
+    # is re-declared here. A value that is not re-passed is silently lost for the
+    # whole elevated run, which is why each one is quoted and forwarded explicitly.
     $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $ScriptPath + '"'))
     if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
         $arguments += @('-ConfigPath', ('"' + $ConfigPath + '"'))
     }
+    if (-not [string]::IsNullOrWhiteSpace($SourcePath)) {
+        $arguments += @('-SourcePath', ('"' + $SourcePath + '"'))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($DestinationPath)) {
+        $arguments += @('-DestinationPath', ('"' + $DestinationPath + '"'))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ClientName)) {
+        $arguments += @('-ClientName', ('"' + $ClientName + '"'))
+    }
     if ($NoPause) { $arguments += '-NoPause' }
     if ($DryRun) { $arguments += '-DryRun' }
     return ($arguments -join ' ')
+}
+
+function Get-RecoveryAutomationHostExecutablePath {
+    [CmdletBinding()]
+    param()
+
+    # The elevated relaunch must use the shell that is actually running, so a
+    # launch from pwsh relaunches pwsh and a launch from Windows PowerShell
+    # relaunches powershell.exe. A fixed $PSHOME\powershell.exe path is wrong for
+    # the first case and can point at a runtime that is not installed for the
+    # second.
+    $hostPath = $null
+    try { $hostPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { $hostPath = $null }
+    if (-not [string]::IsNullOrWhiteSpace($hostPath) -and [System.IO.File]::Exists($hostPath)) {
+        return $hostPath
+    }
+    try {
+        $processPath = (Get-Process -Id $PID).Path
+        if (-not [string]::IsNullOrWhiteSpace($processPath) -and [System.IO.File]::Exists($processPath)) {
+            return $processPath
+        }
+    }
+    catch { }
+    return [System.IO.Path]::Combine($PSHOME, 'powershell.exe')
 }
 
 function Invoke-RecoveryAutomationSelfElevation {
@@ -85,6 +124,9 @@ function Invoke-RecoveryAutomationSelfElevation {
     param(
         [Parameter(Mandatory = $true)][string]$ScriptPath,
         [string]$ConfigPath = '',
+        [string]$SourcePath = '',
+        [string]$DestinationPath = '',
+        [string]$ClientName = '',
         [switch]$NoPause,
         [switch]$DryRun
     )
@@ -100,9 +142,10 @@ function Invoke-RecoveryAutomationSelfElevation {
     }
 
     try {
-        $powershellPath = [System.IO.Path]::Combine($PSHOME, 'powershell.exe')
+        $powershellPath = Get-RecoveryAutomationHostExecutablePath
         $argumentLine = Get-RecoveryAutomationElevationArgumentLine -ScriptPath $ScriptPath `
-            -ConfigPath $ConfigPath -NoPause:$NoPause -DryRun:$DryRun
+            -ConfigPath $ConfigPath -SourcePath $SourcePath -DestinationPath $DestinationPath `
+            -ClientName $ClientName -NoPause:$NoPause -DryRun:$DryRun
         $child = Start-Process -FilePath $powershellPath -ArgumentList $argumentLine `
             -Verb RunAs -WorkingDirectory $PSScriptRoot -Wait -PassThru -ErrorAction Stop
         if ($null -eq $child) {
@@ -147,6 +190,167 @@ function Import-RecoveryAutomationModules {
         $modulePath = Join-Path -Path $PSScriptRoot -ChildPath ('modules\' + $moduleName)
         Import-Module -Name $modulePath -Force -ErrorAction Stop
     }
+}
+
+function Get-RecoveryAutomationDefaultUiProvider {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    # The documented technician UI surface lives in modules/TechnicianUi.psm1.
+    # Nothing is requested at import time: a provider is only built when the
+    # default interactive front door actually needs one, and a host that cannot
+    # provide it (no WinForms, no console) yields $null so the caller stays
+    # fail-closed instead of inventing a selection.
+    try {
+        $command = Get-Command -Name 'Get-TechnicianUiDefaultProvider' -ErrorAction Stop
+        if ($null -eq $command) { return $null }
+        return Get-TechnicianUiDefaultProvider -Name $Name
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-RecoveryAutomationDefaultSourceSelector {
+    [CmdletBinding()]
+    param()
+
+    return {
+        param($Request)
+        $picker = Get-RecoveryAutomationDefaultUiProvider -Name 'PickerProvider'
+        if ($null -ne $picker) {
+            $picked = & $picker ([pscustomobject]@{
+                Purpose     = 'SourceSelection'
+                Description = 'Select the source volume or folder to recover from'
+            })
+            if ($null -ne $picked -and [string]$picked.Decision -eq 'Selected') {
+                return [pscustomobject]@{
+                    Path                 = [string]$picked.Path
+                    SelectionMethod      = 'Picker'
+                    ReadOnlyVerified     = $false
+                    WriteBlocked         = $false
+                    SourceProtected      = $false
+                    HardwareWriteBlocked = $false
+                }
+            }
+            if ($null -ne $picked -and [string]$picked.Decision -eq 'Unavailable') {
+                Write-Host ('The Windows folder browser is unavailable: ' + [string]$picked.Error)
+            }
+        }
+        $typed = Get-RecoveryAutomationDefaultUiProvider -Name 'TypedPathProvider'
+        if ($null -eq $typed) {
+            return [pscustomobject]@{ Path = $null; SelectionMethod = 'Unavailable' }
+        }
+        $answer = & $typed ([pscustomobject]@{
+            Purpose     = 'SourceSelection'
+            Description = 'Source folder or volume'
+        })
+        $path = $null
+        if ($null -ne $answer) { $path = [string]$answer.Path }
+        return [pscustomobject]@{
+            Path                 = $path
+            SelectionMethod      = 'TypedPath'
+            ReadOnlyVerified     = $false
+            WriteBlocked         = $false
+            SourceProtected      = $false
+            HardwareWriteBlocked = $false
+        }
+    }
+}
+
+function Get-RecoveryAutomationDefaultSourceProtectionProvider {
+    [CmdletBinding()]
+    param()
+
+    # A software flag is not proof of write protection, so the default provider
+    # records an operator attestation and nothing more. The technician must type
+    # the exact confirmation token; an empty, redirected, or unrecognised answer
+    # is an unverified source and the workflow stays stopped.
+    return {
+        param($Request)
+        Write-Host ''
+        Write-Host 'Source write protection'
+        Write-Host ('  Source: ' + [string]$Request.Path)
+        Write-Host '  Connect the source through a hardware write blocker, or use another'
+        Write-Host '  documented read-only method that blocks writes at the device.'
+        Write-Host '  Software flags and the read-only attribute are not proof here.'
+        $answer = Read-Host -Prompt "Type BLOCKED only when the source is physically write protected"
+        if ($null -ne $answer -and ([string]$answer).Trim() -eq 'BLOCKED') {
+            return [pscustomobject]@{
+                Verified = $true
+                Evidence = 'Operator attestation: the source was presented through a hardware write blocker or an equivalent device-level read-only method.'
+                Method   = 'OperatorAttestation'
+            }
+        }
+        return [pscustomobject]@{
+            Verified = $false
+            Evidence = 'The technician did not confirm device-level write protection.'
+        }
+    }
+}
+
+function Get-RecoveryAutomationDefaultClientNameProvider {
+    [CmdletBinding()]
+    param()
+
+    return {
+        param($Request)
+        $answer = Read-Host -Prompt 'Client name for this case'
+        return $answer
+    }
+}
+
+function Get-RecoveryAutomationEffectiveClientName {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object]$ConfigurationResult,
+        [AllowNull()][string]$ParameterValue,
+        [scriptblock]$NameProvider = $null,
+        [AllowNull()][string]$PathLabel = 'case'
+    )
+
+    # One precedence rule, used by both the real run and the diagnostic path: the
+    # explicit argument wins, then the configuration file, then the technician
+    # prompt. Nothing is ever inferred from the media.
+    if (-not [string]::IsNullOrWhiteSpace([string]$ParameterValue)) { return [string]$ParameterValue }
+    $configured = $null
+    if ($null -ne $ConfigurationResult) {
+        $configuredConfiguration = Get-RecoveryAutomationValue -InputObject $ConfigurationResult -Names @('Configuration')
+        if ($null -ne $configuredConfiguration) {
+            $configured = [string](Get-RecoveryAutomationValue -InputObject $configuredConfiguration -Names @('ClientName'))
+        }
+        if ([string]::IsNullOrWhiteSpace($configured)) {
+            $configured = [string](Get-RecoveryAutomationValue -InputObject $ConfigurationResult -Names @('ClientName'))
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($configured)) { return $configured }
+    if ($null -eq $NameProvider) { return '' }
+    try {
+        $answer = [string](& $NameProvider ([pscustomobject]@{ Purpose = 'ClientName'; PathLabel = $PathLabel }))
+    }
+    catch {
+        return ''
+    }
+    if ($null -eq $answer) { return '' }
+    return $answer
+}
+
+function Get-RecoveryAutomationEffectiveDestinationText {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object]$ConfigurationResult,
+        [AllowNull()][string]$ParameterValue,
+        [bool]$ParameterBound = $false
+    )
+
+    if ($ParameterBound) { return [string]$ParameterValue }
+    if ($null -eq $ConfigurationResult) { return '' }
+    $configuredConfiguration = Get-RecoveryAutomationValue -InputObject $ConfigurationResult -Names @('Configuration')
+    if ($null -ne $configuredConfiguration) {
+        $configuredRoot = [string](Get-RecoveryAutomationValue -InputObject $configuredConfiguration -Names @('DestinationRoot'))
+        if (-not [string]::IsNullOrWhiteSpace($configuredRoot)) { return $configuredRoot }
+    }
+    return [string](Get-RecoveryAutomationValue -InputObject $ConfigurationResult -Names @('DestinationRoot'))
 }
 
 function New-RecoveryAutomationResult {
@@ -356,6 +560,15 @@ function New-RecoveryAutomationWindowsDiskProvider {
         if ($null -eq $property) { return $null }
         return $property.Value
     }
+    $fieldPresenceReader = {
+        param([object]$Record, [string]$Name)
+        # An absent property and a property that is present but empty are
+        # different statements: the first proves nothing at all, the second is a
+        # value the provider chose to publish.
+        if ($null -eq $Record) { return $false }
+        if ($Record -is [System.Collections.IDictionary]) { return $Record.Contains($Name) }
+        return ($null -ne $Record.PSObject.Properties[$Name])
+    }
     $seamInvoker = {
         param([object]$Seam, [hashtable]$Request)
         # A missing or failing read is never a safe value: it returns nothing and
@@ -363,8 +576,16 @@ function New-RecoveryAutomationWindowsDiskProvider {
         if ($null -eq $Seam) { return $null }
         try { return (& $Seam $Request) } catch { return $null }
     }
+    $seamProbe = {
+        param([object]$Seam, [hashtable]$Request)
+        # The same read, but the caller can tell an empty answer apart from a
+        # failed one. An empty answer is a statement about the device; a failed
+        # read states nothing at all, and the two must never be conflated.
+        if ($null -eq $Seam) { return @{ Ok = $false; Value = $null } }
+        try { return @{ Ok = $true; Value = (& $Seam $Request) } } catch { return @{ Ok = $false; Value = $null } }
+    }
     $membershipReader = {
-        param([object]$Volume, [object]$PartitionQuery, [object]$FieldReader, [object]$SeamInvoker)
+        param([object]$Volume, [object]$PartitionQuery, [object]$FieldReader, [object]$SeamInvoker, [object]$FieldPresenceReader)
         # Physical membership of one volume. It is complete only when the provider
         # proves it: either the volume itself lists its members, or the
         # volume-scoped partition query (docs/IMPLEMENTATION-SPEC.md section 2.3,
@@ -386,17 +607,35 @@ function New-RecoveryAutomationWindowsDiskProvider {
 
         $numbers = New-Object System.Collections.Generic.List[int]
         $declared = New-Object System.Collections.Generic.List[object]
+        $declaredUnparsed = $false
+        $declaredPresent = $false
         foreach ($name in @('PhysicalDiskNumbers', 'DiskNumbers')) {
+            if ($null -eq $FieldPresenceReader) { break }
+            if (-not (& $FieldPresenceReader $Volume $name)) { continue }
+            $declaredPresent = $true
             foreach ($value in @(& $FieldReader $Volume $name)) {
-                if ($null -ne $value) { $declared.Add($value) | Out-Null }
+                if ($null -eq $value) { $declaredUnparsed = $true; continue }
+                $declared.Add($value) | Out-Null
             }
-            if ($declared.Count -gt 0) { break }
+            break
         }
         foreach ($value in $declared) {
             $parsed = 0
             if ([int]::TryParse([string]$value, [ref]$parsed)) {
                 if (-not $numbers.Contains($parsed)) { $numbers.Add($parsed) | Out-Null }
             }
+            else {
+                $declaredUnparsed = $true
+            }
+        }
+        if ($declaredPresent -and $declaredUnparsed) {
+            # A member list the provider could not state in full proves nothing:
+            # keeping only the members that happened to parse would authorize a
+            # subset of an unknown topology.
+            $membership.DiskNumbers = $numbers.ToArray()
+            $membership.Incomplete = $true
+            $membership.IncompleteReason = 'MemberValueUnparsed'
+            return $membership
         }
         if ($numbers.Count -gt 0) {
             $membership.DiskNumbers = $numbers.ToArray()
@@ -406,14 +645,24 @@ function New-RecoveryAutomationWindowsDiskProvider {
         }
 
         $volumeScoped = @(& $SeamInvoker $PartitionQuery @{ Operation = 'PartitionsForVolume'; Volume = $Volume; VolumeGuid = $volumeGuid; DriveLetter = $letter })
+        $volumeScopedUnparsed = $false
         foreach ($partition in $volumeScoped) {
             if ($null -eq $partition) { continue }
             $numberValue = & $FieldReader $partition 'DiskNumber'
-            if ($null -eq $numberValue) { continue }
+            if ($null -eq $numberValue) { $volumeScopedUnparsed = $true; continue }
             $parsed = 0
             if ([int]::TryParse([string]$numberValue, [ref]$parsed)) {
                 if (-not $numbers.Contains($parsed)) { $numbers.Add($parsed) | Out-Null }
             }
+            else {
+                $volumeScopedUnparsed = $true
+            }
+        }
+        if ($volumeScopedUnparsed) {
+            $membership.DiskNumbers = $numbers.ToArray()
+            $membership.Incomplete = $true
+            $membership.IncompleteReason = 'PartitionMemberUnparsed'
+            return $membership
         }
         if ($numbers.Count -gt 0) {
             $membership.DiskNumbers = $numbers.ToArray()
@@ -444,6 +693,163 @@ function New-RecoveryAutomationWindowsDiskProvider {
         return $membership
     }
 
+    $diskTopologyReader = {
+        param([object]$Probe, [object]$FieldReader)
+        # Positive disk-topology evidence from documented partition fields.
+        #
+        # The documented MSFT_Disk schema has no dynamic-disk statement at all
+        # (MSFT_Disk fields: PartitionStyle, Signature, Guid, IsOffline,
+        # IsReadOnly, IsSystem, IsClustered, IsBoot, BootFromDisk, BusType, ...).
+        # A dynamic disk is instead made of Logical Disk Manager partitions, and
+        # the documented MSFT_Partition GptType values name them explicitly:
+        # 'LDM Metadata' 5808c8aa-7e8f-42e0-85d2-e1e90434cfb3 (a Logical Disk
+        # Manager metadata partition on a dynamic disk) and 'LDM Data'
+        # af9b60a0-1431-4f62-bc68-3311714a69ad (an LDM data partition on a
+        # dynamic disk); the MBR form is PARTITION_LDM 0x42.
+        #
+        # So a disk whose partitions state their types and contain no LDM member
+        # is evidenced as an ordinary basic disk, and an unreadable or silent
+        # partition view stays unproven instead of being read as safe.
+        $evidence = [pscustomobject]@{
+            Stated     = $false
+            HasLdm     = $false
+            PartitionCount = 0
+            Reason     = 'PartitionViewUnavailable'
+        }
+        if ($null -eq $Probe -or $Probe.Ok -ne $true) {
+            # The partition view failed or was never available. That states
+            # nothing about the disk, so completeness stays withheld.
+            $evidence.Stated = $false
+            $evidence.Reason = 'PartitionViewUnavailable'
+            return $evidence
+        }
+        $listed = @()
+        if ($null -ne $Probe.Value) { $listed = @($Probe.Value) }
+        if ($listed.Count -eq 0) {
+            # An empty answer proves a disk with no LDM member only when the disk
+            # itself agrees that it has no partitions. Otherwise the empty answer
+            # is ambiguous (an uninitialised disk and a silently skipped read look
+            # identical), so it is reported as unproven.
+            $evidence.Stated = $false
+            $evidence.Reason = 'PartitionListEmptyWithoutCount'
+            return $evidence
+        }
+        foreach ($partition in $listed) {
+            if ($null -eq $partition) { continue }
+            $evidence.PartitionCount = $evidence.PartitionCount + 1
+            $gptType = & $FieldReader $partition 'GptType'
+            $mbrType = & $FieldReader $partition 'MbrType'
+            if ($null -eq $gptType -and $null -eq $mbrType) {
+                $evidence.Stated = $false
+                $evidence.Reason = 'PartitionTypeUnstated'
+                return $evidence
+            }
+            if ($null -ne $gptType) {
+                $gptText = ([string]$gptType).Trim().Trim('{', '}').ToLowerInvariant()
+                if ($gptText -eq '5808c8aa-7e8f-42e0-85d2-e1e90434cfb3' -or $gptText -eq 'af9b60a0-1431-4f62-bc68-3311714a69ad') {
+                    $evidence.HasLdm = $true
+                }
+            }
+            if ($null -ne $mbrType) {
+                $parsedMbr = -1
+                if ([int]::TryParse([string]$mbrType, [ref]$parsedMbr)) {
+                    if ($parsedMbr -eq 0x42) { $evidence.HasLdm = $true }
+                }
+                else {
+                    $evidence.Stated = $false
+                    $evidence.Reason = 'PartitionTypeUnstated'
+                    return $evidence
+                }
+            }
+        }
+        $evidence.Stated = $true
+        $evidence.Reason = 'PartitionTypesRead'
+        return $evidence
+    }
+
+    $pathChainReader = {
+        param([string]$Path, [object]$ItemQuery, [object]$FieldReader, [object]$SeamInvoker)
+        # Reparse resolution. A directory can be reached through a junction, a
+        # mount point, or a symbolic link, and the reviewed path is only proven
+        # when every component on the way was resolved. The documented Windows
+        # PowerShell 5.1 surface for that is Get-Item with -Force, which reports
+        # the ReparsePoint attribute plus LinkType and Target for a link, so the
+        # chain is walked one component at a time and any component that states
+        # neither a link nor a resolved target leaves the chain unproven.
+        $result = [pscustomobject]@{
+            Resolved    = $false
+            ReparseCount = 0
+            Evidence    = 'PathChainUnavailable'
+            Description = ''
+        }
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $result }
+        $current = $Path
+        $depth = 0
+        $chain = New-Object System.Collections.Generic.List[string]
+        while ($depth -lt 8) {
+            $depth = $depth + 1
+            $item = & $SeamInvoker $ItemQuery @{ Operation = 'ItemByPath'; Path = $current }
+            if ($null -eq $item) {
+                $result.Evidence = 'PathComponentUnavailable'
+                return $result
+            }
+            $attributes = [string](& $FieldReader $item 'Attributes')
+            $isReparse = $attributes.Contains('ReparsePoint')
+            if ($isReparse) {
+                $result.ReparseCount = $result.ReparseCount + 1
+                $target = & $FieldReader $item 'Target'
+                if ($null -eq $target) { $target = & $FieldReader $item 'LinkTarget' }
+                if ($null -eq $target -or [string]::IsNullOrWhiteSpace([string]$target)) {
+                    $result.Evidence = 'ReparseTargetUnavailable'
+                    return $result
+                }
+                $targetText = [string]$target
+                if ($targetText.StartsWith('\\?\')) { $targetText = $targetText.Substring(4) }
+                $chain.Add($targetText) | Out-Null
+                $current = $targetText
+                continue
+            }
+            $parent = [System.IO.Path]::GetDirectoryName($current)
+            if ([string]::IsNullOrEmpty($parent)) {
+                $result.Resolved = $true
+                $result.Evidence = 'ReparseChainResolved'
+                $result.Description = [string]::Join(' -> ', $chain.ToArray())
+                return $result
+            }
+            if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $current) {
+                $result.Resolved = $true
+                $result.Evidence = 'ReparseChainResolved'
+                $result.Description = [string]::Join(' -> ', $chain.ToArray())
+                return $result
+            }
+            $nextParent = & $SeamInvoker $ItemQuery @{ Operation = 'ItemByPath'; Path = $parent }
+            if ($null -eq $nextParent) {
+                # The provider cannot walk the ancestor chain, so resolution is
+                # unproven rather than assumed.
+                $result.Evidence = 'PathAncestorUnavailable'
+                return $result
+            }
+            $parentAttributes = [string](& $FieldReader $nextParent 'Attributes')
+            if ($parentAttributes.Contains('ReparsePoint')) {
+                $parentTarget = & $FieldReader $nextParent 'Target'
+                if ($null -eq $parentTarget) { $parentTarget = & $FieldReader $nextParent 'LinkTarget' }
+                if ($null -eq $parentTarget -or [string]::IsNullOrWhiteSpace([string]$parentTarget)) {
+                    $result.Evidence = 'ReparseTargetUnavailable'
+                    return $result
+                }
+                $result.ReparseCount = $result.ReparseCount + 1
+                $parentTargetText = [string]$parentTarget
+                if ($parentTargetText.StartsWith('\\?\')) { $parentTargetText = $parentTargetText.Substring(4) }
+                $chain.Add($parentTargetText) | Out-Null
+                $current = $parentTargetText
+                continue
+            }
+            $current = $parent
+        }
+        $result.Evidence = 'ReparseDepthExceeded'
+        return $result
+    }
+
     if ($null -eq $VolumeQuery) {
         $VolumeQuery = {
             param($request)
@@ -466,6 +872,10 @@ function New-RecoveryAutomationWindowsDiskProvider {
                 $letter = [string]$request['DriveLetter']
                 if ([string]::IsNullOrWhiteSpace($letter)) { return @() }
                 return @(Get-Partition -DriveLetter $letter -ErrorAction Stop)
+            }
+            if ($operation -eq 'PartitionsForDisk') {
+                $diskNumber = [int]$request['DiskNumber']
+                return @(Get-Partition -DiskNumber $diskNumber -ErrorAction Stop)
             }
             throw ('Unsupported partition query operation: ' + $operation)
         }
@@ -493,7 +903,7 @@ function New-RecoveryAutomationWindowsDiskProvider {
             # volume can share physical storage with the source, and dropping it
             # would hide that overlap instead of blocking it.
             $letter = [string](& $fieldReader $volume 'DriveLetter')
-            $membership = & $membershipReader $volume $PartitionQuery $fieldReader $seamInvoker
+            $membership = & $membershipReader $volume $PartitionQuery $fieldReader $seamInvoker $fieldPresenceReader
             $canonical = ''
             if (-not [string]::IsNullOrWhiteSpace($letter)) { $canonical = $letter + ':\' }
             $diskNumber = $null
@@ -530,16 +940,68 @@ function New-RecoveryAutomationWindowsDiskProvider {
             if ([int]$candidateNumber -eq $number) { $disk = $candidate; break }
         }
         if ($null -eq $disk) { return @() }
-        # The dynamic statement and the bus type are the evidence that decide
-        # whether a disk may be treated as a separate static device. A view that
-        # states neither is not evidence of a basic disk, so completeness is
-        # withheld and the module reports MembersIncomplete (indeterminate)
-        # instead of a safe mapping.
+        # Dynamic-disk evidence, in order of strength: a disk view that states the
+        # dynamic flag decides on its own; otherwise the partition view is asked
+        # for LDM membership, because a dynamic disk is built out of LDM
+        # partitions. A view that proves neither is not evidence of a basic disk,
+        # so completeness is withheld and the module reports MembersIncomplete
+        # (indeterminate) instead of a safe mapping.
         $dynamicValue = & $fieldReader $disk 'IsDynamic'
         $busValue = & $fieldReader $disk 'BusType'
         if ($null -eq $busValue) { $busValue = & $fieldReader $disk 'BusTypeString' }
         $dynamicStated = ($null -ne $dynamicValue) -and ($dynamicValue -is [bool])
         $busStated = ($null -ne $busValue)
+        $partitionStyleValue = & $fieldReader $disk 'PartitionStyle'
+        $partitionStyleStated = ($null -ne $partitionStyleValue)
+        $declaredPartitionCount = & $fieldReader $disk 'NumberOfPartitions'
+        $isDynamic = $null
+        $basicDiskEvidence = $null
+        if ($dynamicStated) {
+            $isDynamic = [bool]$dynamicValue
+            if ($isDynamic) { $basicDiskEvidence = 'DiskViewStatesDynamic' }
+            else { $basicDiskEvidence = 'DiskViewStatesBasic' }
+        }
+        else {
+            $partitionEvidence = [pscustomobject]@{ Stated = $false; HasLdm = $false; PartitionCount = 0; Reason = 'PartitionViewUnavailable' }
+            if ($partitionStyleStated) {
+                $probe = & $seamProbe $PartitionQuery @{ Operation = 'PartitionsForDisk'; DiskNumber = $number }
+                $partitionEvidence = & $diskTopologyReader $probe $fieldReader
+                if ($partitionEvidence.Stated) {
+                    if ($null -eq $declaredPartitionCount) {
+                        $partitionEvidence.Stated = $false
+                        $partitionEvidence.Reason = 'PartitionCountUnstated'
+                    }
+                    else {
+                        $declaredCount = -1
+                        if ([int]::TryParse([string]$declaredPartitionCount, [ref]$declaredCount)) {
+                            # A partition view that reports fewer partitions than
+                            # the disk itself declares cannot prove the absence of
+                            # an LDM member, so it stays unproven.
+                            if ($declaredCount -gt $partitionEvidence.PartitionCount) {
+                                $partitionEvidence.Stated = $false
+                                $partitionEvidence.Reason = 'PartitionCountMismatch'
+                            }
+                            elseif ($partitionEvidence.PartitionCount -eq 0 -and $declaredCount -eq 0) {
+                                $partitionEvidence.Stated = $true
+                                $partitionEvidence.Reason = 'NoPartitionsDeclared'
+                            }
+                        }
+                        else {
+                            $partitionEvidence.Stated = $false
+                            $partitionEvidence.Reason = 'PartitionCountUnstated'
+                        }
+                    }
+                }
+            }
+            if ($partitionEvidence.Stated) {
+                $isDynamic = [bool]$partitionEvidence.HasLdm
+                if ($partitionEvidence.HasLdm) { $basicDiskEvidence = 'LdmPartitionPresent' }
+                else { $basicDiskEvidence = 'NoLdmPartitionPresent' }
+            }
+        }
+        $topologyProven = $false
+        if ($dynamicStated) { $topologyProven = $true }
+        elseif ($partitionStyleStated -and ($null -ne $isDynamic)) { $topologyProven = $true }
         return [pscustomobject]@{
             DiskNumber = & $fieldReader $disk 'Number'
             UniqueId = & $fieldReader $disk 'UniqueId'
@@ -554,8 +1016,10 @@ function New-RecoveryAutomationWindowsDiskProvider {
             PNPDeviceID = & $fieldReader $disk 'PNPDeviceID'
             HealthStatus = & $fieldReader $disk 'HealthStatus'
             OperationalStatus = & $fieldReader $disk 'OperationalStatus'
-            IsDynamic = if ($dynamicStated) { [bool]$dynamicValue } else { $null }
-            MembersIncomplete = ((-not $dynamicStated) -or (-not $busStated))
+            IsDynamic = $isDynamic
+            PartitionStyle = if ($partitionStyleStated) { $partitionStyleValue } else { $null }
+            BasicDiskEvidence = $basicDiskEvidence
+            MembersIncomplete = ((-not $topologyProven) -or (-not $busStated))
         }
     }.GetNewClosure()
     $provider.ResolvePath = {
@@ -567,6 +1031,8 @@ function New-RecoveryAutomationWindowsDiskProvider {
             IsContainer = $false
             IsReparsePoint = $true
             ReparseResolved = $false
+            ReparseCount = 0
+            ReparseEvidence = 'PathChainUnavailable'
             VolumeGuid = $null
             VolumePath = $null
             DriveLetter = $null
@@ -583,7 +1049,12 @@ function New-RecoveryAutomationWindowsDiskProvider {
             $record.Exists = $true
             $record.IsContainer = ((& $fieldReader $item 'PSIsContainer') -eq $true)
             $record.IsReparsePoint = ([string](& $fieldReader $item 'Attributes')).Contains('ReparsePoint')
-            $record.ReparseResolved = $true
+            # Existence is not resolution. Every component of the path is walked
+            # before the path may be treated as the reviewed location.
+            $chain = & $pathChainReader $path $ItemQuery $fieldReader $seamInvoker
+            $record.ReparseResolved = [bool]$chain.Resolved
+            $record.ReparseCount = [int]$chain.ReparseCount
+            $record.ReparseEvidence = [string]$chain.Evidence
         }
         $volume = $null
         foreach ($candidate in @(& $seamInvoker $VolumeQuery @{ Operation = 'VolumeForPath'; Path = $path })) {
@@ -593,7 +1064,7 @@ function New-RecoveryAutomationWindowsDiskProvider {
             $record.VolumeGuid = & $fieldReader $volume 'UniqueId'
             $record.VolumePath = & $fieldReader $volume 'Path'
             $record.DriveLetter = [string](& $fieldReader $volume 'DriveLetter')
-            $membership = & $membershipReader $volume $PartitionQuery $fieldReader $seamInvoker
+            $membership = & $membershipReader $volume $PartitionQuery $fieldReader $seamInvoker $fieldPresenceReader
             $record.PhysicalDiskNumbers = @($membership.DiskNumbers)
             $record.PartitionNumber = $membership.PartitionNumber
             $record.MembersIncomplete = $membership.Incomplete
@@ -2034,12 +2505,53 @@ function Invoke-RecoveryAutomation {
         }
         $configurationResult = $resolvedConfigurationResult
 
+        # The default front door. Until now the documented interactive inputs
+        # existed only as injected seams, so a plain double-click run reached the
+        # source gate and stopped with nothing selected. Each default is built
+        # only when the caller did not inject its own seam, and only on Windows
+        # outside a dry run: a diagnostic run must never prompt, and a host
+        # without the documented UI surfaces stays fail-closed instead of
+        # inventing a source, a destination, or write-protection evidence.
+        $interactiveHost = (-not $DryRun) -and ([string]$env:OS -eq 'Windows_NT')
+        if ($null -eq $InteractionProvider) {
+            $defaultInteraction = Get-RecoveryAutomationDefaultUiProvider -Name 'InteractionProvider'
+            if ($null -ne $defaultInteraction) { $InteractionProvider = $defaultInteraction }
+        }
+        $defaultNameProvider = $null
+        if ($interactiveHost) {
+            if ($null -eq $SourceSelector) { $SourceSelector = Get-RecoveryAutomationDefaultSourceSelector }
+            if ($null -eq $SourceProtectionProvider) {
+                $SourceProtectionProvider = Get-RecoveryAutomationDefaultSourceProtectionProvider
+            }
+            if ($null -eq $DestinationPickerProvider) {
+                $DestinationPickerProvider = Get-RecoveryAutomationDefaultUiProvider -Name 'PickerProvider'
+            }
+            if ($null -eq $TypedDestinationProvider) {
+                $TypedDestinationProvider = Get-RecoveryAutomationDefaultUiProvider -Name 'TypedPathProvider'
+            }
+            $defaultNameProvider = Get-RecoveryAutomationDefaultClientNameProvider
+        }
+
         $runtime = Get-RecoveryAutomationRuntimeEvidence -Provider $RuntimeProvider
         if ($DryRun) {
+            # The diagnostic path reports the inputs the caller actually supplied,
+            # so a technician can prove that the arguments survived the launcher
+            # and the elevation boundary before a real case is opened. Absent
+            # values stay absent: a dry run never prompts and never invents one.
+            $requestedInputs = [pscustomobject]@{
+                SourcePath      = if ($PSBoundParameters.ContainsKey('SourcePath')) { [string]$SourcePath } else { '' }
+                DestinationPath = Get-RecoveryAutomationEffectiveDestinationText -ConfigurationResult $configurationResult `
+                    -ParameterValue $DestinationPath -ParameterBound ($PSBoundParameters.ContainsKey('DestinationPath'))
+                ClientName      = Get-RecoveryAutomationEffectiveClientName -ConfigurationResult $configurationResult `
+                    -ParameterValue $ClientName
+                ConfigPath      = $resolvedConfigPath
+            }
             $dryRunMessage = 'Configuration and runtime diagnostics completed; no vendor or recovery-media operation was attempted.'
-            return New-RecoveryAutomationResult -Success $true -ExitCode 0 -Mode 'DryRun' `
+            $dryRunResult = New-RecoveryAutomationResult -Success $true -ExitCode 0 -Mode 'DryRun' `
                 -ReasonCode $null -Message $dryRunMessage -ConfigurationResult $configurationResult `
                 -VendorLaunchAttempted $false -RecoveryMediaTouched $false -Runtime $runtime
+            $dryRunResult | Add-Member -NotePropertyName RequestedInputs -NotePropertyValue $requestedInputs -Force
+            return $dryRunResult
         }
         if (-not $runtime.Compatible) {
             return New-RecoveryAutomationResult -Success $false -ExitCode 2 -Mode 'Preflight' `
@@ -2123,14 +2635,9 @@ function Invoke-RecoveryAutomation {
         $sourceIdentity | Add-Member -NotePropertyName ReadOnlyVerified -NotePropertyValue $protection.Verified -Force
         $sourceIdentity | Add-Member -NotePropertyName ReadOnlyEvidence -NotePropertyValue $protection.Evidence -Force
 
-        $destinationText = $null
-        if ($PSBoundParameters.ContainsKey('DestinationPath')) {
-            $destinationText = $DestinationPath
-        }
-        elseif (-not [string]::IsNullOrWhiteSpace([string]$configurationResult.Configuration.DestinationRoot)) {
-            $destinationText = [string]$configurationResult.Configuration.DestinationRoot
-        }
-        else {
+        $destinationText = Get-RecoveryAutomationEffectiveDestinationText -ConfigurationResult $configurationResult `
+            -ParameterValue $DestinationPath -ParameterBound ($PSBoundParameters.ContainsKey('DestinationPath'))
+        if ([string]::IsNullOrWhiteSpace([string]$destinationText)) {
             $picker = $null
             $typedPicker = $null
             if ($null -ne $DestinationPickerProvider) {
@@ -2176,8 +2683,8 @@ function Invoke-RecoveryAutomation {
                 -DestinationIdentity $destinationIdentity -Capacity $capacity
         }
 
-        $effectiveClientName = $ClientName
-        if ([string]::IsNullOrWhiteSpace($effectiveClientName)) { $effectiveClientName = [string]$configurationResult.Configuration.ClientName }
+        $effectiveClientName = Get-RecoveryAutomationEffectiveClientName -ConfigurationResult $configurationResult `
+            -ParameterValue $ClientName -NameProvider $defaultNameProvider -PathLabel ([string]$destinationText)
         if ([string]::IsNullOrWhiteSpace($effectiveClientName)) {
             return New-RecoveryAutomationResult -Success $false -ExitCode 5 -Mode 'Case' `
                 -ReasonCode 'ClientNameInvalid' -Message 'A client name is required before a job folder can be claimed.' `
@@ -2522,8 +3029,15 @@ function Invoke-RecoveryAutomation {
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
+    # The front door forwards every documented technician input. A value that is
+    # not forwarded is lost for the whole run, so this list is explicit instead
+    # of a silent parameter subset.
+    $forwarded = @{}
+    foreach ($forwardName in @('SourcePath', 'DestinationPath', 'ClientName')) {
+        if ($PSBoundParameters.ContainsKey($forwardName)) { $forwarded[$forwardName] = $PSBoundParameters[$forwardName] }
+    }
     $elevationLaunch = Invoke-RecoveryAutomationSelfElevation -ScriptPath $PSCommandPath `
-        -ConfigPath $RecoveryConfigPath -NoPause:$NoPause -DryRun:$DryRun
+        -ConfigPath $RecoveryConfigPath @forwarded -NoPause:$NoPause -DryRun:$DryRun
     if ($elevationLaunch.ShouldExit) {
         if ($elevationLaunch.Success) {
             exit $elevationLaunch.ExitCode
@@ -2534,7 +3048,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         Write-Output $elevationResult
         exit $elevationResult.ExitCode
     }
-    $entryResult = Invoke-RecoveryAutomation -ConfigPath $RecoveryConfigPath -NoPause:$NoPause -DryRun:$DryRun
+    $entryResult = Invoke-RecoveryAutomation -ConfigPath $RecoveryConfigPath @forwarded -NoPause:$NoPause -DryRun:$DryRun
     Write-Output $entryResult
     exit $entryResult.ExitCode
 }
