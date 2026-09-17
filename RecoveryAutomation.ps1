@@ -2793,8 +2793,11 @@ function Invoke-RecoveryAutomation {
         $state | Add-Member -NotePropertyName MetadataPath -NotePropertyValue $case.MetadataPath -Force
         $state | Add-Member -NotePropertyName SourceProtection -NotePropertyValue $protection -Force
 
+        # The lock must state the job it was acquired for. The resume read refuses
+        # a lock whose job id is empty (LockNotBound), because a lock that does
+        # not name its case can bind to the state of a different case.
         $lock = JobState\Lock-RecoveryJob -JobPath $folderResult.JobFolderPath -LockProvider $LockProvider -Clock $Clock `
-            -Owner ('RecoveryAutomation/' + $jobId)
+            -JobId $jobId -Owner ('RecoveryAutomation/' + $jobId)
         if (-not $lock.Acquired) {
             return New-RecoveryAutomationResult -Success $false -ExitCode 6 -Mode 'Case' `
                 -ReasonCode $lock.ReasonCode -Message ([string]$lock.Message) `
