@@ -175,6 +175,8 @@ Describe 'File Scavenger launch boundary' {
                 Pid = 99
                 StartTime = '2026-09-16T09:00:00.0000000Z'
                 Handle = 'fixture-handle'
+                Success = $true
+                Alive = $true
             }
         }.GetNewClosure()
         $writer = {
@@ -249,7 +251,7 @@ Describe 'File Scavenger launch boundary' {
         $runner = {
             param($path)
             [void]$order.Add('runner')
-            return [pscustomobject]@{ Path = $path; Pid = 99; StartTime = '2026-09-16T09:00:00.0000000Z' }
+            return [pscustomobject]@{ Success = $true; Path = $path; Pid = 99; StartTime = '2026-09-16T09:00:00.0000000Z'; Alive = $true }
         }.GetNewClosure()
         $executable = [pscustomobject]@{
             Path = 'fixture-scavenger.exe'
@@ -456,7 +458,7 @@ Describe 'File Scavenger launch boundary' {
         }.GetNewClosure()
         $runner = {
             param($path)
-            return [pscustomobject]@{ Path = $path; Pid = 110; StartTime = '2026-09-16T09:00:00.0000000Z' }
+            return [pscustomobject]@{ Success = $true; Path = $path; Pid = 110; StartTime = '2026-09-16T09:00:00.0000000Z'; Alive = $true }
         }.GetNewClosure()
         $executable = [pscustomobject]@{
             Path = 'fixture-scavenger.exe'
@@ -490,7 +492,7 @@ Describe 'File Scavenger launch boundary' {
         }.GetNewClosure()
         $runner = {
             param($path)
-            return [pscustomobject]@{ Path = $path; Pid = 99; StartTime = '2026-09-16T09:00:00.0000000Z' }
+            return [pscustomobject]@{ Success = $true; Path = $path; Pid = 99; StartTime = '2026-09-16T09:00:00.0000000Z'; Alive = $true }
         }.GetNewClosure()
         $executable = [pscustomobject]@{
             Path = 'fixture-scavenger.exe'
@@ -531,7 +533,7 @@ Describe 'File Scavenger launch boundary' {
         }.GetNewClosure()
         $runner = {
             param($path)
-            return [pscustomobject]@{ Path = $path; Pid = 99; StartTime = '2026-09-16T09:00:00.0000000Z' }
+            return [pscustomobject]@{ Success = $true; Path = $path; Pid = 99; StartTime = '2026-09-16T09:00:00.0000000Z'; Alive = $true }
         }.GetNewClosure()
         $executable = [pscustomobject]@{
             Path = 'fixture-scavenger.exe'
@@ -571,7 +573,7 @@ Describe 'File Scavenger launch boundary' {
         }.GetNewClosure()
         $runner = {
             param($path)
-            return [pscustomobject]@{ Path = $path; Pid = 99; StartTime = '2026-09-16T09:00:00.0000000Z' }
+            return [pscustomobject]@{ Success = $true; Path = $path; Pid = 99; StartTime = '2026-09-16T09:00:00.0000000Z'; Alive = $true }
         }.GetNewClosure()
         $executable = [pscustomobject]@{
             Path = 'fixture-scavenger.exe'
@@ -1014,5 +1016,388 @@ Describe 'File Scavenger close guards' {
         $verified.Result | Should -Be 'ForceCloseRequested'
         $verified.GuardSatisfied | Should -BeTrue
         $verified.PostCloseVerificationRequired | Should -BeTrue
+    }
+}
+
+Describe 'File Scavenger launch outcome verification' {
+
+    BeforeAll {
+        function New-LaunchExecutable {
+            [CmdletBinding()]
+            param()
+
+            return [pscustomobject]@{
+                Path           = 'fixture-scavenger.exe'
+                Product        = 'File Scavenger'
+                ProductVersion = '7.1.1.13'
+                EvidenceSource = 'owner-live-record'
+                IdentityStatus = 'Verified'
+            }
+        }
+
+        function New-LaunchState {
+            [CmdletBinding()]
+            param([string]$CurrentState = 'CASE_READY')
+
+            return [pscustomobject]@{
+                CurrentState           = $CurrentState
+                LogFlushed             = $true
+                LockOwned              = $true
+                ElevationPassed        = $true
+                FreshSafetyCheckPassed = $true
+            }
+        }
+
+        function New-LaunchEventRecorder {
+            [CmdletBinding()]
+            param([Parameter(Mandatory = $true)][object]$Target)
+
+            return {
+                param($event)
+                [void]$Target.Add($event)
+                return $true
+            }.GetNewClosure()
+        }
+    }
+
+    It 'refuses a runner result that states an explicit Boolean failure and retains the reported identity' {
+        $events = New-Object System.Collections.ArrayList
+        $runner = {
+            param($path)
+            return [pscustomobject]@{
+                Success   = $false
+                Path      = $path
+                Pid       = 4201
+                StartTime = '2026-09-16T09:00:00.0000000Z'
+                Alive     = $true
+            }
+        }.GetNewClosure()
+
+        $result = Start-FileScavenger -Executable (New-LaunchExecutable) -State (New-LaunchState) `
+            -ProcessRunner $runner -EventWriter (New-LaunchEventRecorder -Target $events)
+
+        $result.Allowed | Should -BeFalse
+        $result.Result | Should -Be 'InterruptedUnknown'
+        $result.ReasonCode | Should -Be 'RunnerReportedFailure'
+        $result.Started | Should -BeTrue
+        $result.SuggestedState | Should -Be 'INTERRUPTED_UNKNOWN'
+        $result.ProcessIdentity.Pid | Should -Be 4201
+        $result.ProcessIdentity.Path | Should -Be 'fixture-scavenger.exe'
+        @($events | Where-Object { [string]$_.Result -eq 'Launched' }).Count | Should -Be 0
+    }
+
+    It 'refuses a runner result that reports the process already exited' {
+        $events = New-Object System.Collections.ArrayList
+        $runner = {
+            param($path)
+            return [pscustomobject]@{
+                Success   = $true
+                Path      = $path
+                Pid       = 4202
+                StartTime = '2026-09-16T09:00:00.0000000Z'
+                HasExited = $true
+            }
+        }.GetNewClosure()
+
+        $result = Start-FileScavenger -Executable (New-LaunchExecutable) -State (New-LaunchState) `
+            -ProcessRunner $runner -EventWriter (New-LaunchEventRecorder -Target $events)
+
+        $result.Allowed | Should -BeFalse
+        $result.Result | Should -Be 'InterruptedUnknown'
+        $result.ReasonCode | Should -Be 'ProcessNotAlive'
+        $result.ProcessIdentity.Pid | Should -Be 4202
+        @($events | Where-Object { [string]$_.Result -eq 'Launched' }).Count | Should -Be 0
+    }
+
+    It 'refuses a runner result that states no liveness at all' {
+        $events = New-Object System.Collections.ArrayList
+        $runner = {
+            param($path)
+            return [pscustomobject]@{
+                Success   = $true
+                Path      = $path
+                Pid       = 4203
+                StartTime = '2026-09-16T09:00:00.0000000Z'
+            }
+        }.GetNewClosure()
+
+        $result = Start-FileScavenger -Executable (New-LaunchExecutable) -State (New-LaunchState) `
+            -ProcessRunner $runner -EventWriter (New-LaunchEventRecorder -Target $events)
+
+        $result.Allowed | Should -BeFalse
+        $result.Result | Should -Be 'InterruptedUnknown'
+        $result.ReasonCode | Should -Be 'ProcessLivenessUnstated'
+        $result.ProcessIdentity.Pid | Should -Be 4203
+    }
+
+    It 'refuses contradictory liveness statements' {
+        $events = New-Object System.Collections.ArrayList
+        $runner = {
+            param($path)
+            return [pscustomobject]@{
+                Success   = $true
+                Path      = $path
+                Pid       = 4204
+                StartTime = '2026-09-16T09:00:00.0000000Z'
+                Alive     = $true
+                HasExited = $true
+            }
+        }.GetNewClosure()
+
+        $result = Start-FileScavenger -Executable (New-LaunchExecutable) -State (New-LaunchState) `
+            -ProcessRunner $runner -EventWriter (New-LaunchEventRecorder -Target $events)
+
+        $result.Allowed | Should -BeFalse
+        $result.Result | Should -Be 'InterruptedUnknown'
+        $result.ReasonCode | Should -Be 'ProcessLivenessContradictory'
+        $result.ProcessIdentity.Pid | Should -Be 4204
+    }
+
+    It 'refuses a non-Boolean success statement' {
+        $events = New-Object System.Collections.ArrayList
+        $runner = {
+            param($path)
+            return [pscustomobject]@{
+                Success   = 'true'
+                Path      = $path
+                Pid       = 4205
+                StartTime = '2026-09-16T09:00:00.0000000Z'
+                Alive     = $true
+            }
+        }.GetNewClosure()
+
+        $result = Start-FileScavenger -Executable (New-LaunchExecutable) -State (New-LaunchState) `
+            -ProcessRunner $runner -EventWriter (New-LaunchEventRecorder -Target $events)
+
+        $result.Allowed | Should -BeFalse
+        $result.Result | Should -Be 'InterruptedUnknown'
+        $result.ReasonCode | Should -Be 'RunnerSuccessNotBoolean'
+    }
+
+    It 'refuses an absent success statement' {
+        $events = New-Object System.Collections.ArrayList
+        $runner = {
+            param($path)
+            return [pscustomobject]@{
+                Path      = $path
+                Pid       = 4206
+                StartTime = '2026-09-16T09:00:00.0000000Z'
+                Alive     = $true
+            }
+        }.GetNewClosure()
+
+        $result = Start-FileScavenger -Executable (New-LaunchExecutable) -State (New-LaunchState) `
+            -ProcessRunner $runner -EventWriter (New-LaunchEventRecorder -Target $events)
+
+        $result.Allowed | Should -BeFalse
+        $result.Result | Should -Be 'InterruptedUnknown'
+        $result.ReasonCode | Should -Be 'RunnerSuccessMissing'
+    }
+
+    It 'never falls back to the requested path when the runner reports no executable path' {
+        $events = New-Object System.Collections.ArrayList
+        $runner = {
+            param($path)
+            return [pscustomobject]@{
+                Success   = $true
+                Pid       = 4207
+                StartTime = '2026-09-16T09:00:00.0000000Z'
+                Alive     = $true
+            }
+        }.GetNewClosure()
+
+        $result = Start-FileScavenger -Executable (New-LaunchExecutable) -State (New-LaunchState) `
+            -ProcessRunner $runner -EventWriter (New-LaunchEventRecorder -Target $events)
+
+        $result.Allowed | Should -BeFalse
+        $result.Result | Should -Be 'InterruptedUnknown'
+        $result.ReasonCode | Should -Be 'ProcessPathMissing'
+        # The identity keeps only what the runner reported: the PID identifies the
+        # process, while the path stays empty instead of being filled in from the
+        # requested executable.
+        $result.ProcessIdentity.Pid | Should -Be 4207
+        $result.ProcessIdentity.Path | Should -BeNullOrEmpty
+    }
+
+    It 'refuses a runner result whose reported path does not match the verified executable' {
+        $events = New-Object System.Collections.ArrayList
+        $runner = {
+            param($path)
+            return [pscustomobject]@{
+                Success   = $true
+                Path      = 'fixture-other.exe'
+                Pid       = 4208
+                StartTime = '2026-09-16T09:00:00.0000000Z'
+                Alive     = $true
+            }
+        }.GetNewClosure()
+
+        $result = Start-FileScavenger -Executable (New-LaunchExecutable) -State (New-LaunchState) `
+            -ProcessRunner $runner -EventWriter (New-LaunchEventRecorder -Target $events)
+
+        $result.Allowed | Should -BeFalse
+        $result.Result | Should -Be 'InterruptedUnknown'
+        $result.ReasonCode | Should -Be 'ProcessPathMismatch'
+        $result.Started | Should -BeTrue
+        $result.ProcessIdentity.Path | Should -Be 'fixture-other.exe'
+    }
+
+    It 'refuses a runner result that reports scanner arguments as an interrupted-unknown outcome' {
+        $events = New-Object System.Collections.ArrayList
+        $runner = {
+            param($path)
+            return [pscustomobject]@{
+                Success   = $true
+                Path      = $path
+                Pid       = 4209
+                StartTime = '2026-09-16T09:00:00.0000000Z'
+                Alive     = $true
+                Arguments = @('-undocumented-switch')
+            }
+        }.GetNewClosure()
+
+        $result = Start-FileScavenger -Executable (New-LaunchExecutable) -State (New-LaunchState) `
+            -ProcessRunner $runner -EventWriter (New-LaunchEventRecorder -Target $events)
+
+        $result.Allowed | Should -BeFalse
+        $result.Result | Should -Be 'InterruptedUnknown'
+        $result.ReasonCode | Should -Be 'UnexpectedLaunchArguments'
+        $result.ProcessIdentity.Pid | Should -Be 4209
+    }
+
+    It 'treats zero runner results as an interrupted-unknown outcome' {
+        $events = New-Object System.Collections.ArrayList
+        $runner = {
+            param($path)
+            [void]$path
+        }.GetNewClosure()
+
+        $result = Start-FileScavenger -Executable (New-LaunchExecutable) -State (New-LaunchState) `
+            -ProcessRunner $runner -EventWriter (New-LaunchEventRecorder -Target $events)
+
+        $result.Allowed | Should -BeFalse
+        $result.Result | Should -Be 'InterruptedUnknown'
+        $result.ReasonCode | Should -Be 'ProcessIdentityMissing'
+        $result.Started | Should -BeFalse
+        $result.RunnerInvoked | Should -BeTrue
+        $result.VendorProcessPossible | Should -BeTrue
+        $result.SuggestedState | Should -Be 'INTERRUPTED_UNKNOWN'
+    }
+
+    It 'treats multiple runner results as an interrupted-unknown outcome' {
+        $events = New-Object System.Collections.ArrayList
+        $runner = {
+            param($path)
+            return @(
+                [pscustomobject]@{ Success = $true; Path = $path; Pid = 4210; StartTime = '2026-09-16T09:00:00.0000000Z'; Alive = $true }
+                [pscustomobject]@{ Success = $true; Path = $path; Pid = 4211; StartTime = '2026-09-16T09:00:00.0000000Z'; Alive = $true }
+            )
+        }.GetNewClosure()
+
+        $result = Start-FileScavenger -Executable (New-LaunchExecutable) -State (New-LaunchState) `
+            -ProcessRunner $runner -EventWriter (New-LaunchEventRecorder -Target $events)
+
+        $result.Allowed | Should -BeFalse
+        $result.Result | Should -Be 'InterruptedUnknown'
+        $result.ReasonCode | Should -Be 'AmbiguousProcessIdentity'
+        $result.ProcessIdentity | Should -BeNullOrEmpty
+        $result.VendorProcessPossible | Should -BeTrue
+    }
+
+    It 'treats a throwing runner as an interrupted-unknown outcome' {
+        $events = New-Object System.Collections.ArrayList
+        $runner = {
+            param($path)
+            throw ('launch failed for ' + [string]$path)
+        }.GetNewClosure()
+
+        $result = Start-FileScavenger -Executable (New-LaunchExecutable) -State (New-LaunchState) `
+            -ProcessRunner $runner -EventWriter (New-LaunchEventRecorder -Target $events)
+
+        $result.Allowed | Should -BeFalse
+        $result.Result | Should -Be 'InterruptedUnknown'
+        $result.ReasonCode | Should -Be 'LaunchOutcomeUnknown'
+        $result.VendorProcessPossible | Should -BeTrue
+        $result.ProcessIdentity | Should -BeNullOrEmpty
+        @($events | Where-Object { $_.EventType -eq 'StageInterruptedUnknown' }).Count | Should -Be 1
+    }
+
+    It 'emits one durable interrupted-unknown event with the retained identity and no launch event' {
+        $events = New-Object System.Collections.ArrayList
+        $runner = {
+            param($path)
+            return [pscustomobject]@{
+                Success = $true
+                Path    = $path
+                Pid     = 4212
+                StartTime = '2026-09-16T09:00:00.0000000Z'
+            }
+        }.GetNewClosure()
+
+        $result = Start-FileScavenger -Executable (New-LaunchExecutable) -State (New-LaunchState) `
+            -ProcessRunner $runner -EventWriter (New-LaunchEventRecorder -Target $events)
+
+        $events.Count | Should -Be 2
+        $events[1].EventType | Should -Be 'StageInterruptedUnknown'
+        $events[1].Stage | Should -Be 'LAUNCH'
+        $events[1].Result | Should -Be 'InterruptedUnknown'
+        $events[1].ProcessIdentity.Pid | Should -Be 4212
+        @($events | Where-Object { [string]$_.Result -eq 'Launched' }).Count | Should -Be 0
+        $result.UnknownEvent.Attempted | Should -BeTrue
+        $result.UnknownEvent.Succeeded | Should -BeTrue
+        $result.LaunchEvent | Should -BeNullOrEmpty
+    }
+
+    It 'allows no retry, no close, and no later vendor action for an ambiguous result' {
+        $events = New-Object System.Collections.ArrayList
+        $runner = {
+            param($path)
+            return [pscustomobject]@{
+                Success = $true
+                Path    = $path
+                Pid     = 4213
+                StartTime = '2026-09-16T09:00:00.0000000Z'
+            }
+        }.GetNewClosure()
+
+        $result = Start-FileScavenger -Executable (New-LaunchExecutable) -State (New-LaunchState) `
+            -ProcessRunner $runner -EventWriter (New-LaunchEventRecorder -Target $events)
+
+        $result.Allowed | Should -BeFalse
+        $result.RetryAllowed | Should -BeFalse
+        $result.CloseAllowed | Should -BeFalse
+        $result.VendorActionAllowed | Should -BeFalse
+        $result.RequiresOperator | Should -BeTrue
+        $result.NeedsReview | Should -BeTrue
+        $result.ManualGate | Should -BeNullOrEmpty
+    }
+
+    It 'keeps a pre-launch refusal distinguishable from an interrupted-unknown outcome' {
+        $events = New-Object System.Collections.ArrayList
+        $calls = New-Object System.Collections.ArrayList
+        $events = New-Object System.Collections.ArrayList
+        $runner = {
+            param($path)
+            [void]$calls.Add($path)
+            return [pscustomobject]@{
+                Success = $true
+                Path    = $path
+                Pid     = 4214
+                StartTime = '2026-09-16T09:00:00.0000000Z'
+                Alive   = $true
+            }
+        }.GetNewClosure()
+
+        $result = Start-FileScavenger -Executable (New-LaunchExecutable) -State (New-LaunchState -CurrentState 'SHORT_SCAN_FINISHED') `
+            -ProcessRunner $runner -EventWriter (New-LaunchEventRecorder -Target $events)
+
+        $result.Allowed | Should -BeFalse
+        $result.Result | Should -Be 'Blocked'
+        $result.RunnerInvoked | Should -BeFalse
+        $result.VendorProcessPossible | Should -BeFalse
+        $result.SuggestedState | Should -BeNullOrEmpty
+        $result.UnknownEvent | Should -BeNullOrEmpty
+        $result.ProcessIdentity | Should -BeNullOrEmpty
+        $calls.Count | Should -Be 0
     }
 }

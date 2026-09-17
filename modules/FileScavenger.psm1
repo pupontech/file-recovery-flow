@@ -306,6 +306,10 @@ function Invoke-FsDefaultProcessRunner {
         throw 'The verified File Scavenger process did not start.'
     }
 
+    # The runner states the launch result the module requires: explicit success,
+    # the path it actually started, and the observed liveness. A process that has
+    # already exited is reported as exited, so the caller treats it as an
+    # interrupted-unknown outcome instead of a clean launch.
     return [pscustomobject]@{
         Path = $Path
         Pid = $process.Id
@@ -313,6 +317,8 @@ function Invoke-FsDefaultProcessRunner {
         Handle = $null
         Process = $process
         Arguments = @()
+        Success = $true
+        HasExited = [bool]$process.HasExited
     }
 }
 
@@ -321,9 +327,6 @@ function Get-FsProcessIdentityFromResult {
     param(
         [Parameter(Mandatory = $true)]
         [object]$RunnerResult,
-
-        [Parameter(Mandatory = $true)]
-        [object]$Executable,
 
         [AllowNull()]
         [object]$State
@@ -334,25 +337,29 @@ function Get-FsProcessIdentityFromResult {
         $RunnerResult = $nested
     }
 
+    # The identity is only what the runner actually observed. The requested
+    # executable path is never substituted for a path the runner did not report:
+    # a fabricated path would record an unverified process as the verified File
+    # Scavenger identity, and the launch statement below compares the reported
+    # path against the requested one.
     $path = Get-FsProperty -InputObject $RunnerResult -Names @('Path', 'ProcessPath', 'ExecutablePath')
-    if ([string]::IsNullOrWhiteSpace([string]$path)) {
-        $path = Get-FsProperty -InputObject $Executable -Names @('Path', 'ExecutablePath')
-    }
 
     $pidValue = Get-FsProperty -InputObject $RunnerResult -Names @('Pid', 'PID', 'Id', 'ProcessId')
     $pidNumber = 0
     if ($null -eq $pidValue -or -not [int]::TryParse(([string]$pidValue), [ref]$pidNumber) -or $pidNumber -le 0) {
-        return [pscustomobject]@{ Valid = $false; ReasonCode = 'ProcessIdentityMissing'; Reason = 'The process runner did not return a valid process ID.' }
+        return [pscustomobject]@{ Valid = $false; PathStated = $false; ReasonCode = 'ProcessIdentityMissing'; Reason = 'The process runner did not return a valid process ID.' }
     }
 
     $startTime = Get-FsProperty -InputObject $RunnerResult -Names @('StartTime', 'ProcessStartTime')
-    if ($null -eq $startTime -or [string]::IsNullOrWhiteSpace([string]$startTime)) {
-        return [pscustomobject]@{ Valid = $false; ReasonCode = 'ProcessStartTimeMissing'; Reason = 'The process runner did not return a process start time.' }
+    if (-not (Test-FsUsableStartTime -Value $startTime)) {
+        return [pscustomobject]@{ Valid = $false; PathStated = $false; ReasonCode = 'ProcessStartTimeMissing'; Reason = 'The process runner did not return a usable process start time.' }
     }
 
     $jobId = Get-FsProperty -InputObject $State -Names @('JobId', 'JobIdentity')
+    $pathStated = -not [string]::IsNullOrWhiteSpace([string]$path)
     return [pscustomobject]@{
         Valid = $true
+        PathStated = $pathStated
         Identity = [pscustomobject]@{
             Path = [string]$path
             Pid = $pidNumber
@@ -364,6 +371,289 @@ function Get-FsProcessIdentityFromResult {
         }
         ReasonCode = $null
         Reason = $null
+    }
+}
+
+function Test-FsUsableStartTime {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return $false
+    }
+    if ($Value -is [datetime] -or $Value -is [datetimeoffset]) {
+        return $true
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$Value)) {
+        return $false
+    }
+    $parsed = [datetime]::MinValue
+    return [datetime]::TryParse(([string]$Value), [ref]$parsed)
+}
+
+function Get-FsLaunchStatement {
+    <#
+    .SYNOPSIS
+        Evaluates the single post-runner statement that authorizes a LaunchResult.
+
+    .DESCRIPTION
+        A process identity alone does not prove that the launch is understood:
+        the runner can report a PID, a path, and a start time while stating that
+        the launch failed or that the process already exited. The launch is only
+        treated as started when the same runner result states:
+
+          * an explicit Boolean success (absent or non-Boolean is ambiguous),
+          * the executable path the runner actually started (never the requested
+            path substituted for a missing report), matching the verified
+            executable,
+          * a usable process start time, and
+          * an explicit, non-contradictory liveness statement.
+
+        Every other shape returns Valid = $false with a named reason so the
+        caller can report an interrupted-unknown outcome instead of a clean
+        launch or a plain failure.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$RunnerResult,
+
+        [Parameter(Mandatory = $true)]
+        [object]$Executable
+    )
+
+    $successSeen = $false
+    $successValue = $true
+    foreach ($name in @('Success', 'Succeeded', 'IsSuccess', 'Ok', 'Launched')) {
+        $value = Get-FsProperty -InputObject $RunnerResult -Names @($name)
+        if ($null -eq $value) {
+            continue
+        }
+        $successSeen = $true
+        if ($value -isnot [bool]) {
+            return [pscustomobject]@{
+                Valid = $false
+                ReasonCode = 'RunnerSuccessNotBoolean'
+                Reason = ('The process runner reported the {0} field as a non-Boolean value.' -f $name)
+            }
+        }
+        if (-not [bool]$value) {
+            $successValue = $false
+        }
+    }
+    if (-not $successSeen) {
+        return [pscustomobject]@{
+            Valid = $false
+            ReasonCode = 'RunnerSuccessMissing'
+            Reason = 'The process runner did not state an explicit Boolean launch success.'
+        }
+    }
+    if (-not $successValue) {
+        return [pscustomobject]@{
+            Valid = $false
+            ReasonCode = 'RunnerReportedFailure'
+            Reason = 'The process runner stated that the launch did not succeed.'
+        }
+    }
+
+    $requestedPath = [string](Get-FsProperty -InputObject $Executable -Names @('Path', 'ExecutablePath'))
+    $reportedPath = [string](Get-FsProperty -InputObject $RunnerResult -Names @('Path', 'ProcessPath', 'ExecutablePath'))
+    if ([string]::IsNullOrWhiteSpace($reportedPath)) {
+        return [pscustomobject]@{
+            Valid = $false
+            ReasonCode = 'ProcessPathMissing'
+            Reason = 'The process runner did not report the executable path it started.'
+        }
+    }
+    if (-not [string]::Equals($reportedPath.Trim(), $requestedPath.Trim(), [StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{
+            Valid = $false
+            ReasonCode = 'ProcessPathMismatch'
+            Reason = 'The started process path does not match the verified executable path.'
+        }
+    }
+
+    $startTime = Get-FsProperty -InputObject $RunnerResult -Names @('StartTime', 'ProcessStartTime')
+    if (-not (Test-FsUsableStartTime -Value $startTime)) {
+        return [pscustomobject]@{
+            Valid = $false
+            ReasonCode = 'ProcessStartTimeMissing'
+            Reason = 'The process runner did not return a usable process start time.'
+        }
+    }
+
+    $aliveStated = $false
+    $notAliveStated = $false
+    $livenessStated = $false
+    $livenessUnclear = $false
+    foreach ($name in @('Alive', 'IsAlive', 'Running')) {
+        $value = Get-FsProperty -InputObject $RunnerResult -Names @($name)
+        if ($null -eq $value) {
+            continue
+        }
+        $livenessStated = $true
+        if ($value -isnot [bool]) {
+            $livenessUnclear = $true
+            continue
+        }
+        if ([bool]$value) {
+            $aliveStated = $true
+        }
+        else {
+            $notAliveStated = $true
+        }
+    }
+    foreach ($name in @('HasExited', 'Exited', 'IsExited')) {
+        $value = Get-FsProperty -InputObject $RunnerResult -Names @($name)
+        if ($null -eq $value) {
+            continue
+        }
+        $livenessStated = $true
+        if ($value -isnot [bool]) {
+            $livenessUnclear = $true
+            continue
+        }
+        if ([bool]$value) {
+            $notAliveStated = $true
+        }
+        else {
+            $aliveStated = $true
+        }
+    }
+
+    if (-not $livenessStated) {
+        return [pscustomobject]@{
+            Valid = $false
+            ReasonCode = 'ProcessLivenessUnstated'
+            Reason = 'The process runner did not state whether the started process is alive.'
+        }
+    }
+    if ($livenessUnclear) {
+        return [pscustomobject]@{
+            Valid = $false
+            ReasonCode = 'ProcessLivenessUnclear'
+            Reason = 'The process runner stated liveness as a non-Boolean value.'
+        }
+    }
+    if ($aliveStated -and $notAliveStated) {
+        return [pscustomobject]@{
+            Valid = $false
+            ReasonCode = 'ProcessLivenessContradictory'
+            Reason = 'The process runner stated both that the process is alive and that it is not.'
+        }
+    }
+    if ($notAliveStated) {
+        return [pscustomobject]@{
+            Valid = $false
+            ReasonCode = 'ProcessNotAlive'
+            Reason = 'The process runner stated that the process is not running.'
+        }
+    }
+
+    return [pscustomobject]@{ Valid = $true; ReasonCode = $null; Reason = $null }
+}
+
+function Write-FsLaunchInterruptedUnknownEvent {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [scriptblock]$EventWriter,
+
+        [AllowNull()]
+        [string]$StateName,
+
+        [AllowNull()]
+        [object]$AttemptId,
+
+        [AllowNull()]
+        [object]$ProcessIdentity,
+
+        [AllowNull()]
+        [string]$ErrorCode
+    )
+
+    $event = [pscustomobject]@{
+        EventType = 'StageInterruptedUnknown'
+        Stage = 'LAUNCH'
+        State = $StateName
+        AttemptId = $AttemptId
+        Result = 'InterruptedUnknown'
+        ProcessIdentity = $ProcessIdentity
+        Error = $ErrorCode
+    }
+    return Write-FsDurableEvent -EventWriter $EventWriter -Event $event
+}
+
+function New-FsUnknownLaunchResult {
+    <#
+    .SYNOPSIS
+        Builds the interrupted-unknown launch outcome.
+
+    .DESCRIPTION
+        Used for every post-runner ambiguity: the runner may have started the
+        vendor process even though the result cannot be trusted. The outcome
+        never claims a launch, retains the process identity when one is
+        independently valid, permits no retry, no close, and no later vendor
+        action, and carries the interrupted-unknown state the caller must make
+        durable before anything else happens.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ReasonCode,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Reason,
+
+        [AllowNull()]
+        [object]$Executable,
+
+        [AllowNull()]
+        [object]$ProcessIdentity,
+
+        [AllowNull()]
+        [object]$Error,
+
+        [AllowNull()]
+        [object]$AuthorizationEvent,
+
+        [AllowNull()]
+        [object]$LaunchEvent,
+
+        [AllowNull()]
+        [object]$UnknownEvent
+    )
+
+    $started = $false
+    if ($null -ne $ProcessIdentity) {
+        $started = $true
+    }
+
+    return [pscustomobject]@{
+        Allowed = $false
+        Started = $started
+        Result = 'InterruptedUnknown'
+        ReasonCode = $ReasonCode
+        Reason = $Reason
+        Error = $Error
+        Executable = $Executable
+        ProcessIdentity = $ProcessIdentity
+        Arguments = @()
+        RunnerInvoked = $true
+        VendorProcessPossible = $true
+        RetryAllowed = $false
+        CloseAllowed = $false
+        VendorActionAllowed = $false
+        RequiresOperator = $true
+        NeedsReview = $true
+        SuggestedState = 'INTERRUPTED_UNKNOWN'
+        ManualGate = $null
+        AuthorizationEvent = $AuthorizationEvent
+        LaunchEvent = $LaunchEvent
+        UnknownEvent = $UnknownEvent
     }
 }
 
@@ -558,6 +848,8 @@ function Start-FileScavenger {
         $failure = New-FsResult -Allowed $false -Result 'Blocked' -ReasonCode $identityCheck.ReasonCode -Reason $identityCheck.Reason -Error $null -Evidence $Executable
         $failure | Add-Member -NotePropertyName Started -NotePropertyValue $false
         $failure | Add-Member -NotePropertyName Arguments -NotePropertyValue @()
+        $failure | Add-Member -NotePropertyName RunnerInvoked -NotePropertyValue $false
+        $failure | Add-Member -NotePropertyName VendorProcessPossible -NotePropertyValue $false
         return $failure
     }
 
@@ -566,6 +858,8 @@ function Start-FileScavenger {
         $failure = New-FsResult -Allowed $false -Result 'Blocked' -ReasonCode $preconditionCheck.ReasonCode -Reason $preconditionCheck.Reason -Error $null -Evidence $State
         $failure | Add-Member -NotePropertyName Started -NotePropertyValue $false
         $failure | Add-Member -NotePropertyName Arguments -NotePropertyValue @()
+        $failure | Add-Member -NotePropertyName RunnerInvoked -NotePropertyValue $false
+        $failure | Add-Member -NotePropertyName VendorProcessPossible -NotePropertyValue $false
         return $failure
     }
 
@@ -607,91 +901,93 @@ function Start-FileScavenger {
             -Error ([pscustomobject]@{ Type = $authorizationWrite.ReasonCode; Message = $authorizationWrite.Error }) -Evidence $authorizationEvent
         $failure | Add-Member -NotePropertyName Started -NotePropertyValue $false
         $failure | Add-Member -NotePropertyName Arguments -NotePropertyValue @()
+        $failure | Add-Member -NotePropertyName RunnerInvoked -NotePropertyValue $false
+        $failure | Add-Member -NotePropertyName VendorProcessPossible -NotePropertyValue $false
         $failure | Add-Member -NotePropertyName AuthorizationEvent -NotePropertyValue $authorizationWrite
         return $failure
     }
 
+    # Everything after this point is a post-runner outcome: the runner was
+    # invoked, so a vendor process may exist even when the result cannot be
+    # trusted. A result the module cannot read as a launched, live process is an
+    # interrupted-unknown outcome, never a plain launch failure, because a plain
+    # failure would invite a retry that could start a second vendor process.
     try {
         $runnerOutput = @($ProcessRunner.Invoke($executablePath))
     }
     catch {
-        $eventResult = Write-FsDurableEvent -EventWriter $EventWriter -Event ([pscustomobject]@{ EventType = 'StageFailed'; Stage = 'LAUNCH'; Result = 'Failed'; Error = $_.Exception.Message })
-        return [pscustomobject]@{
-            Allowed = $false
-            Started = $false
-            Result = 'Failed'
-            ReasonCode = 'LaunchFailed'
-            Reason = $_.Exception.Message
-            Error = [pscustomobject]@{ Type = $_.Exception.GetType().FullName; Message = $_.Exception.Message; LogWrite = $eventResult }
-            Arguments = @()
-            AuthorizationEvent = $authorizationWrite
-        }
+        $runnerErrorMessage = $_.Exception.Message
+        $unknownEvent = Write-FsLaunchInterruptedUnknownEvent -EventWriter $EventWriter -StateName $acknowledgedStateName `
+            -AttemptId $acknowledgedAttemptId -ProcessIdentity $null -ErrorCode 'LaunchOutcomeUnknown'
+        return (New-FsUnknownLaunchResult -ReasonCode 'LaunchOutcomeUnknown' `
+            -Reason 'The process runner failed while starting File Scavenger, so a vendor process may be running; the attempt is interrupted-unknown and requires review.' `
+            -Executable $Executable -ProcessIdentity $null `
+            -Error ([pscustomobject]@{ Type = 'LaunchOutcomeUnknown'; Message = $runnerErrorMessage }) `
+            -AuthorizationEvent $authorizationWrite -UnknownEvent $unknownEvent)
     }
 
     if ($runnerOutput.Count -eq 0) {
-        return [pscustomobject]@{
-            Allowed = $false
-            Started = $false
-            Result = 'Failed'
-            ReasonCode = 'LaunchFailed'
-            Reason = 'The process runner returned no process identity.'
-            Error = [pscustomobject]@{ Type = 'ProcessIdentityMissing'; Message = 'No process identity was returned.' }
-            Arguments = @()
-        }
+        $unknownEvent = Write-FsLaunchInterruptedUnknownEvent -EventWriter $EventWriter -StateName $acknowledgedStateName `
+            -AttemptId $acknowledgedAttemptId -ProcessIdentity $null -ErrorCode 'ProcessIdentityMissing'
+        return (New-FsUnknownLaunchResult -ReasonCode 'ProcessIdentityMissing' `
+            -Reason 'The process runner returned no process identity, so a vendor process may be running without a recorded identity; the attempt is interrupted-unknown and requires review.' `
+            -Executable $Executable -ProcessIdentity $null `
+            -Error ([pscustomobject]@{ Type = 'ProcessIdentityMissing'; Message = 'No process identity was returned.' }) `
+            -AuthorizationEvent $authorizationWrite -UnknownEvent $unknownEvent)
     }
     if ($runnerOutput.Count -ne 1) {
-        return [pscustomobject]@{
-            Allowed = $false
-            Started = $false
-            Result = 'Failed'
-            ReasonCode = 'AmbiguousProcessIdentity'
-            Reason = 'The process runner returned more than one process identity.'
-            Error = [pscustomobject]@{ Type = 'AmbiguousProcessIdentity'; Message = 'Multiple process identities were returned.' }
-            Arguments = @()
-        }
+        $unknownEvent = Write-FsLaunchInterruptedUnknownEvent -EventWriter $EventWriter -StateName $acknowledgedStateName `
+            -AttemptId $acknowledgedAttemptId -ProcessIdentity $null -ErrorCode 'AmbiguousProcessIdentity'
+        return (New-FsUnknownLaunchResult -ReasonCode 'AmbiguousProcessIdentity' `
+            -Reason 'The process runner returned more than one process identity, so the started process cannot be identified; the attempt is interrupted-unknown and requires review.' `
+            -Executable $Executable -ProcessIdentity $null `
+            -Error ([pscustomobject]@{ Type = 'AmbiguousProcessIdentity'; Message = 'Multiple process identities were returned.' }) `
+            -AuthorizationEvent $authorizationWrite -UnknownEvent $unknownEvent)
     }
 
     $runnerResult = $runnerOutput[0]
+
+    $processIdentity = Get-FsProcessIdentityFromResult -RunnerResult $runnerResult -State $State
+    $identityValue = $null
+    if ($processIdentity.Valid) {
+        $identityValue = $processIdentity.Identity
+    }
+
     $reportedArguments = Get-FsProperty -InputObject $runnerResult -Names @('Arguments', 'ArgumentList', 'ScannerArguments')
     if ($null -ne $reportedArguments) {
         $reported = @($reportedArguments)
         if ($reported.Count -gt 0 -and -not ([string]::IsNullOrWhiteSpace([string]$reported[0]) -and $reported.Count -eq 1)) {
-            return [pscustomobject]@{
-                Allowed = $false
-                Started = $false
-                Result = 'Failed'
-                ReasonCode = 'UnexpectedLaunchArguments'
-                Reason = 'The process runner reported scanner arguments; launch is refused.'
-                Error = [pscustomobject]@{ Type = 'UnexpectedLaunchArguments'; Message = 'Only the verified executable path may be passed.' }
-                Arguments = @()
-            }
+            $unknownEvent = Write-FsLaunchInterruptedUnknownEvent -EventWriter $EventWriter -StateName $acknowledgedStateName `
+                -AttemptId $acknowledgedAttemptId -ProcessIdentity $identityValue -ErrorCode 'UnexpectedLaunchArguments'
+            return (New-FsUnknownLaunchResult -ReasonCode 'UnexpectedLaunchArguments' `
+                -Reason 'The process runner reported scanner arguments, so the vendor process cannot be trusted to be the launch-only process; the attempt is interrupted-unknown and requires review.' `
+                -Executable $Executable -ProcessIdentity $identityValue `
+                -Error ([pscustomobject]@{ Type = 'UnexpectedLaunchArguments'; Message = 'Only the verified executable path may be passed.' }) `
+                -AuthorizationEvent $authorizationWrite -UnknownEvent $unknownEvent)
         }
     }
 
-    $processIdentity = Get-FsProcessIdentityFromResult -RunnerResult $runnerResult -Executable $Executable -State $State
     if (-not $processIdentity.Valid) {
-        return [pscustomobject]@{
-            Allowed = $false
-            Started = $false
-            Result = 'Failed'
-            ReasonCode = $processIdentity.ReasonCode
-            Reason = $processIdentity.Reason
-            Error = [pscustomobject]@{ Type = $processIdentity.ReasonCode; Message = $processIdentity.Reason }
-            Arguments = @()
-        }
+        $unknownEvent = Write-FsLaunchInterruptedUnknownEvent -EventWriter $EventWriter -StateName $acknowledgedStateName `
+            -AttemptId $acknowledgedAttemptId -ProcessIdentity $null -ErrorCode $processIdentity.ReasonCode
+        return (New-FsUnknownLaunchResult -ReasonCode $processIdentity.ReasonCode -Reason $processIdentity.Reason `
+            -Executable $Executable -ProcessIdentity $null `
+            -Error ([pscustomobject]@{ Type = $processIdentity.ReasonCode; Message = $processIdentity.Reason }) `
+            -AuthorizationEvent $authorizationWrite -UnknownEvent $unknownEvent)
     }
 
-    $candidatePath = [string](Get-FsProperty -InputObject $Executable -Names @('Path', 'ExecutablePath'))
-    if (-not [string]::Equals($processIdentity.Identity.Path, $candidatePath, [StringComparison]::OrdinalIgnoreCase)) {
-        return [pscustomobject]@{
-            Allowed = $false
-            Started = $false
-            Result = 'Failed'
-            ReasonCode = 'ProcessPathMismatch'
-            Reason = 'The started process path does not match the verified executable path.'
-            Error = [pscustomobject]@{ Type = 'ProcessPathMismatch'; Message = 'A different process identity was returned.' }
-            Arguments = @()
-        }
+    # A PID, a path, and a start time are not enough. The runner must also state
+    # an explicit success, the path it actually started (matching the verified
+    # executable), and an explicit, non-contradictory liveness statement before
+    # any process is treated as a launched File Scavenger.
+    $launchStatement = Get-FsLaunchStatement -RunnerResult $runnerResult -Executable $Executable
+    if (-not $launchStatement.Valid) {
+        $unknownEvent = Write-FsLaunchInterruptedUnknownEvent -EventWriter $EventWriter -StateName $acknowledgedStateName `
+            -AttemptId $acknowledgedAttemptId -ProcessIdentity $identityValue -ErrorCode $launchStatement.ReasonCode
+        return (New-FsUnknownLaunchResult -ReasonCode $launchStatement.ReasonCode -Reason $launchStatement.Reason `
+            -Executable $Executable -ProcessIdentity $identityValue `
+            -Error ([pscustomobject]@{ Type = $launchStatement.ReasonCode; Message = $launchStatement.Reason }) `
+            -AuthorizationEvent $authorizationWrite -UnknownEvent $unknownEvent)
     }
 
     $eventResult = Write-FsDurableEvent -EventWriter $EventWriter -Event ([pscustomobject]@{
@@ -706,34 +1002,13 @@ function Start-FileScavenger {
         # The vendor process is already running, so this is never a clean launch
         # failure: the identity is retained, the interrupted-unknown event is
         # attempted, and the outcome fails closed for operator review.
-        $unknownEvent = [pscustomobject]@{
-            EventType = 'StageInterruptedUnknown'
-            Stage = 'LAUNCH'
-            State = $acknowledgedStateName
-            AttemptId = $acknowledgedAttemptId
-            Result = 'InterruptedUnknown'
-            ProcessIdentity = $processIdentity.Identity
-            Error = $eventResult.ReasonCode
-        }
-        $unknownWrite = Write-FsDurableEvent -EventWriter $EventWriter -Event $unknownEvent
-        return [pscustomobject]@{
-            Allowed = $false
-            Started = $true
-            Result = 'InterruptedUnknown'
-            ReasonCode = 'LaunchEventNotDurable'
-            Reason = 'The launched File Scavenger process could not be recorded durably; the attempt is interrupted-unknown and requires review.'
-            Error = [pscustomobject]@{ Type = 'LaunchEventNotDurable'; Message = $eventResult.Error; LogWrite = $eventResult }
-            Arguments = @()
-            Executable = $Executable
-            ProcessIdentity = $processIdentity.Identity
-            AuthorizationEvent = $authorizationWrite
-            LaunchEvent = $eventResult
-            UnknownEvent = $unknownWrite
-            RequiresOperator = $true
-            NeedsReview = $true
-            SuggestedState = 'INTERRUPTED_UNKNOWN'
-            ManualGate = $null
-        }
+        $unknownWrite = Write-FsLaunchInterruptedUnknownEvent -EventWriter $EventWriter -StateName $acknowledgedStateName `
+            -AttemptId $acknowledgedAttemptId -ProcessIdentity $processIdentity.Identity -ErrorCode $eventResult.ReasonCode
+        return (New-FsUnknownLaunchResult -ReasonCode 'LaunchEventNotDurable' `
+            -Reason 'The launched File Scavenger process could not be recorded durably; the attempt is interrupted-unknown and requires review.' `
+            -Executable $Executable -ProcessIdentity $processIdentity.Identity `
+            -Error ([pscustomobject]@{ Type = 'LaunchEventNotDurable'; Message = $eventResult.Error; LogWrite = $eventResult }) `
+            -AuthorizationEvent $authorizationWrite -LaunchEvent $eventResult -UnknownEvent $unknownWrite)
     }
 
     return [pscustomobject]@{
@@ -746,6 +1021,8 @@ function Start-FileScavenger {
         Executable = $Executable
         ProcessIdentity = $processIdentity.Identity
         Arguments = @()
+        RunnerInvoked = $true
+        VendorProcessPossible = $true
         RequiresOperator = $true
         ManualGate = $null
         AuthorizationEvent = $authorizationWrite
