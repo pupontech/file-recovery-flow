@@ -327,6 +327,23 @@ action and after every boundary event. Log initialization, append, serialization
 or flush failure blocks the next vendor action. The log must not contain
 credentials or unnecessary recovered-content data.
 
+Live writer ownership check, and its exact limits. The default writer records a
+whole-content SHA-256 of the record when it opens it (on creation and on resume)
+and, before every append, compares the current byte length and the current
+whole-content digest with the recorded values. The hash is streamed through a
+fixed 64 KiB buffer with `Int64` arithmetic: the record is never read into a
+single whole-file array and the length is never narrowed to 32 bits. A changed
+length, or any same-length rewrite of any byte, is refused as `LogAppendFailed`
+and blocks every later write through that writer. The guarantee is bounded and
+must not be described as more than it is: the digest is established when the
+writer opens the record, so a rewrite performed before that open (including
+before a resume) has no earlier digest to disagree with and is not detectable,
+and a same-folder log can be rewritten by an actor that also rewrites its own
+baseline. A detected mismatch is an operational stop, never a reason to retry,
+recreate, truncate, or redirect the log, and this guard is not tamper-proof
+storage or immutable history. The cost is one whole-record read before and one
+after each append, which is accepted for case logs of this size.
+
 Do not use `>`, `>>`, or `Out-File` for machine state. Runtime encodings are
 explicit: the v1 log writer emits ASCII-safe JSONL with `ASCII` encoding, using
 escaped dynamic values or failing closed if lossless serialization is not
