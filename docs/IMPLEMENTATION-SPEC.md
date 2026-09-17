@@ -252,10 +252,29 @@ Public contract:
   `Sanitize-RecoveryName` alias remains for callers of the earlier public
   contract; it maps to this approved-verb function without an import warning.
 - `New-RecoveryJobFolder -RootPath <literal path> -ClientName <string>
-  -Clock <provider> -ClaimProvider <provider>` creates and claims a new case
-  folder without overwriting. The claim uses a `CreateNew`-style operation and a
-  bounded suffix sequence (`-001` through `-099`); exhaustion stops and asks for
-  another root.
+  -Clock <provider> -ClaimProvider <provider> [-PreclaimSafetyCheck <scriptblock>]`
+  creates and claims a new case folder without overwriting. The claim uses a
+  `CreateNew`-style operation and a bounded suffix sequence (`-001` through
+  `-099`); exhaustion stops and asks for another root.
+- `-PreclaimSafetyCheck` is the pre-write destination proof. It is invoked once
+  per collision-free candidate, twice per candidate folder: stage
+  `BeforeDirectoryCreate` immediately before the directory is created, and stage
+  `BeforeClaimWrite` immediately before the job-claim marker is written. The
+  callback receives `Path`, `PathExists`, `ProofPath`, `ProofPathExists`,
+  `RootPath`, and `Stage`. `ProofPath` is the nearest existing ancestor of the
+  candidate: the candidate folder does not exist when the first stage runs, so it
+  cannot be resolved by the provider and the proof has to be taken on a path that
+  can be. The callback must return exactly one result carrying an explicit
+  Boolean `Allowed = $true`; absent, non-Boolean, multiple, throwing, or
+  unreadable results are refused as `PreclaimSafetyUnproven`, and no directory or
+  claim byte is written. The production entry point always supplies this
+  callback; a standalone caller that omits it performs no separation proof, and
+  the helper must not be used to create a case without a proof.
+- A refused candidate is never adopted, merged with, or deleted. A stage-two
+  refusal leaves the already-created, still empty candidate directory in place
+  (nothing inside another folder is ever read, moved, or removed) and reports the
+  refusal reason; the case itself is not created and the claim marker does not
+  exist.
 
 The primary provider order is Storage module, Storage namespace CIM, then the
 Win32 association fallback. If none can prove the mapping, the result is
@@ -265,6 +284,15 @@ corresponding disk object.[25][26][27][29][30] Dynamic disks, Storage Spaces,
 File-Backed Virtual, network shares, VHDs, or any topology with incomplete
 physical membership are not treated as separate merely because a drive letter
 exists.
+
+A member list is complete only when it is proven exhaustive. A volume record that
+states `MembersIncomplete = $false` is still refused as incomplete when it also
+states a `DeclaredMemberCount` larger than the number of members that were
+resolved: a partition-scoped answer that returned fewer disks than the topology
+states is a subset, and a subset never proves the absence of a member. An absent
+`DeclaredMemberCount` is not a statement at all, so a record that does not carry
+one keeps the previous behaviour; a value that cannot be read as a non-negative
+count is refused as incomplete rather than treated as an agreement.
 
 A disk number is a session label and must never be the sole persisted identity.
 Use a strong `UniqueId`/`UniqueIdFormat` match, or an exact
@@ -313,9 +341,17 @@ Public contract:
 - `New-RecoveryJobState -JobId -SourceIdentity -DestinationIdentity
   -ApplicationEvidence -Paths -WorkflowVersion` returns a schema version 1
   state object in `NEW` or `PREFLIGHT_PENDING`.
-- `Read-RecoveryJobState -Path <literal path> -Lock <object>` parses and
-  validates schema, job ID, required properties, event sequence, identity
-  evidence, and state/event consistency. Invalid state returns a stop result.
+- `Read-RecoveryJobState -Path <literal path> -Lock <object> [-Clock <provider>]
+  [-ExpectedOwner <string>]` parses and validates schema, job ID, required
+  properties, event sequence, identity evidence, and state/event consistency.
+  Invalid state returns a stop result. The durable lock is a capability, not
+  descriptive metadata: the read refuses when the lock lease has expired
+  (`LockLeaseExpired`), when the presented owner does not match the owner recorded
+  in the lock file (`LockOwnerMismatch`), when an expected owner was supplied that
+  is not the durable owner (`LockOwnerMismatch`), and when the lock does not state
+  the job id it was acquired for (`LockNotBound`). An unexpired lease owned by the
+  caller still reads successfully, so a live worker is not blocked by the new
+  checks. Callers that omit `-Clock` are evaluated against UTC now.
 - `Write-RecoveryJobState -Path <literal path> -State <object> -Writer
   <provider>` writes a validated snapshot atomically inside the owned case folder.
 - `Test-RecoveryStateTransition -From <state> -To <state> -Context <object>`
