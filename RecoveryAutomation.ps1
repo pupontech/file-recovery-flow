@@ -540,6 +540,31 @@ function New-RecoveryAutomationWindowsDiskProvider {
         $volumeGuid = [string](& $FieldReader $Volume 'UniqueId')
         $letter = [string](& $FieldReader $Volume 'DriveLetter')
 
+        # A member count the volume view itself states is published on this record
+        # so the completeness guard can compare it with the members actually
+        # resolved. Only a count the device states is ever published: a count this
+        # provider could only infer (for example a disk's NumberOfPartitions, which
+        # counts the partitions of every volume on that disk, not the members of
+        # this one) is left unstated instead of being invented here.
+        $declaredCount = $null
+        $declaredStated = $false
+        if ($null -ne $FieldPresenceReader -and (& $FieldPresenceReader $Volume 'DeclaredMemberCount')) {
+            $declaredStated = $true
+            $declaredValue = & $FieldReader $Volume 'DeclaredMemberCount'
+            $parsedDeclared = -1
+            if ($null -ne $declaredValue -and [int]::TryParse([string]$declaredValue, [ref]$parsedDeclared) -and $parsedDeclared -ge 0) {
+                $declaredCount = $parsedDeclared
+                $membership | Add-Member -NotePropertyName DeclaredMemberCount -NotePropertyValue $parsedDeclared -Force
+            }
+        }
+        if ($declaredStated -and $null -eq $declaredCount) {
+            # A stated member count that cannot be read is not a statement of
+            # completeness, so membership stays unproven.
+            $membership.Incomplete = $true
+            $membership.IncompleteReason = 'DeclaredMemberCountUnparsed'
+            return $membership
+        }
+
         $numbers = New-Object System.Collections.Generic.List[int]
         $declared = New-Object System.Collections.Generic.List[object]
         $declaredUnparsed = $false
@@ -849,7 +874,7 @@ function New-RecoveryAutomationWindowsDiskProvider {
             if (-not [string]::IsNullOrWhiteSpace($letter)) { $canonical = $letter + ':\' }
             $diskNumber = $null
             if ((-not $membership.Incomplete) -and (@($membership.DiskNumbers).Count -eq 1)) { $diskNumber = @($membership.DiskNumbers)[0] }
-            [void]$items.Add([pscustomobject]@{
+            $volumeItem = [pscustomobject]@{
                 DriveLetter = $letter
                 AccessPaths = @((& $fieldReader $volume 'Path'))
                 CanonicalPath = $canonical
@@ -864,7 +889,14 @@ function New-RecoveryAutomationWindowsDiskProvider {
                 PhysicalDiskNumbers = @($membership.DiskNumbers)
                 MembersIncomplete = $membership.Incomplete
                 MembershipEvidence = $membership.IncompleteReason
-            })
+            }
+            # The count is published only when the volume view stated one: an absent
+            # field means the topology never claimed a member count, which keeps the
+            # previous behaviour instead of inventing a number.
+            if ($null -ne $membership.PSObject.Properties['DeclaredMemberCount']) {
+                $volumeItem | Add-Member -NotePropertyName DeclaredMemberCount -NotePropertyValue $membership.DeclaredMemberCount -Force
+            }
+            [void]$items.Add($volumeItem)
         }
         return $items.ToArray()
     }.GetNewClosure()
@@ -1007,6 +1039,11 @@ function New-RecoveryAutomationWindowsDiskProvider {
             $record.PartitionNumber = $membership.PartitionNumber
             $record.MembersIncomplete = $membership.Incomplete
             $record.MembershipEvidence = $membership.IncompleteReason
+            if ($null -ne $membership.PSObject.Properties['DeclaredMemberCount']) {
+                # Published only when the volume view stated it; absence keeps the
+                # previous behaviour for a topology that never claimed a count.
+                $record | Add-Member -NotePropertyName DeclaredMemberCount -NotePropertyValue $membership.DeclaredMemberCount -Force
+            }
             if ((-not $membership.Incomplete) -and (@($membership.DiskNumbers).Count -eq 1)) {
                 $record.DiskNumber = @($membership.DiskNumbers)[0]
             }
