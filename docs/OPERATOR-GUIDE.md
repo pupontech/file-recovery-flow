@@ -131,29 +131,41 @@ script the launcher. The switches the workflow and its CI lanes use are:
 | Argument | Effect |
 | --- | --- |
 | `-ConfigPath <path>` | Use an explicit configuration file instead of the default one. |
+| `-SourcePath <path>` | Name the source explicitly instead of answering the source prompt. The path is still resolved, identity-checked, and protection-checked the same way. |
+| `-DestinationPath <path>` | Name the destination root explicitly instead of answering the destination prompt. It is still resolved and refused if it shares a physical disk with the source. |
+| `-ClientName <name>` | Supply the client name explicitly instead of answering the prompt. It is still sanitized and validated before it becomes a folder name. |
 | `-NoPause` | Suppress the launcher's closing prompt. Equivalent to `RECOVERY_NO_PAUSE=1`. |
-| `-DryRun` | Bounded diagnostic path used by CI: it validates and reports without starting a vendor process and without touching real recovery media. It is not a way to skip a safety check in a real case. |
+| `-DryRun` | Bounded diagnostic path used by CI: it validates and reports without starting a vendor process and without touching real recovery media. It is not a way to skip a safety check in a real case. It also reports the inputs it received, so you can confirm that a launcher or an elevated relaunch passed your arguments through. |
 
-Running the batch file with no arguments is always valid and is the normal case.
+Running the batch file with no arguments is always valid and is the normal case: the
+workflow then asks for each input in order.
 
 ## 4. What the workflow asks you for, in order
 
 1. Preflight: runtime, configuration, elevation, and discovery of File Scavenger and
    R-Studio, without launching either product. Missing, ambiguous, or unexpected
    products become a gate.
-2. Source selection. You name the source; the tool resolves its canonical path, volume,
-   partition, complete physical-disk set, and identity snapshot. Record the
-   read-only or write-blocker evidence.
-3. Destination selection through the Windows folder browser (or a typed path through
-   the same checks). The tool resolves the destination the same way and compares the
-   full physical-disk sets.
-4. Client name, path budget, and case creation: a uniquely claimed job folder, the
+2. Source selection. The Windows folder browser opens first, and the typed prompt is
+   the fallback; `-SourcePath` answers it directly. You name the source; the tool
+   resolves its canonical path, volume, partition, complete physical-disk set, and
+   identity snapshot.
+3. Write-protection evidence. Connect the source through a hardware write blocker (or
+   another documented read-only method that blocks writes at the device) and type the
+   confirmation the prompt asks for. This records an operator attestation; it is not a
+   measurement of the interface, and a software flag is not accepted as proof.
+4. Destination selection through the Windows folder browser (or a typed path,
+   or `-DestinationPath`). The tool resolves the destination the same way and compares
+   the full physical-disk sets.
+5. Client name, path budget, and case creation: a uniquely claimed job folder, the
    lock, the metadata, and the flushed event log. No vendor process starts before the
    case is durable.
-5. Revalidation, then the File Scavenger launch and the manual gate that follows it.
-6. Quick scan, `Step 2: Save`, and verification as separate recorded steps.
-7. Optional Long scan, only after the short recovery result is verified.
-8. Graceful close, then the launch-only R-Studio handoff.
+6. Revalidation, then the File Scavenger launch and the manual gate that follows it.
+7. Quick scan, `Step 2: Save`, and verification as separate recorded steps.
+8. Optional Long scan, only after the short recovery result is verified.
+9. Graceful close, then the launch-only R-Studio handoff. R-Studio receives only the
+   documented `-safe` switch and, when a safe path is available, `-log` pointing at a
+   dedicated `rstudio-host.log` inside the case folder. The vendor log is never the
+   case event log.
 
 Every step is fail-closed. A failure at any step leaves the case state and the log
 durable and prevents later work.
