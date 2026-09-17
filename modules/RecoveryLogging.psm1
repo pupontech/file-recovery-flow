@@ -591,8 +591,48 @@ function Sync-RecoveryLog {
 
 Set-Alias -Name Flush-RecoveryLog -Value Sync-RecoveryLog -Scope Local
 
+function Close-RecoveryLog {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][object]$Writer
+    )
+
+    # Releases the log file handle. The workflow opens the case log with
+    # FileShare.Read, so on Windows the file stays locked until this close runs:
+    # Pester TestDrive cleanup, job-folder moves, and any exclusive reader need
+    # the handle gone. Closing an already closed log is not an error (cleanup
+    # paths may run more than once), and a refused close is always reported.
+    $result = [pscustomobject]@{
+        Success    = $false
+        Path       = $null
+        ReasonCode = $null
+        Message    = $null
+    }
+    if ($null -eq $Writer) {
+        $result.ReasonCode = 'LogCloseFailed'
+        $result.Message = 'No log writer was supplied to close.'
+        return $result
+    }
+    $path = [string](Get-RecoveryLogMemberValue -Object $Writer -Name 'Path')
+    $result.Path = $path
+    if ((Get-RecoveryLogMemberValue -Object $Writer -Name 'IsOpen') -ne $true) {
+        $result.Success = $true
+        return $result
+    }
+    $close = Invoke-RecoveryLogProviderCall -Provider (Get-RecoveryLogMemberValue -Object $Writer -Name 'Provider') -Operation 'Close' -Arguments @{ Handle = $Writer; Path = $path }
+    if (-not $close.Success) {
+        $result.ReasonCode = 'LogCloseFailed'
+        $result.Message = $close.Message
+        return $result
+    }
+    $Writer.IsOpen = $false
+    $result.Success = $true
+    return $result
+}
+
 Export-ModuleMember -Function @(
     'Sync-RecoveryLog',
+    'Close-RecoveryLog',
     'New-RecoveryLog',
     'Test-RecoveryLog',
     'Write-RecoveryLogEntry'

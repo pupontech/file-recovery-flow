@@ -554,8 +554,12 @@ function Resolve-RecoveryPathIdentity {
     $result.CanonicalPath = ConvertTo-RecoveryIdentityText $canonical
     $exists = Get-RecoveryMemberValue -Object $record -Name 'Exists'
     $isContainer = Get-RecoveryMemberValue -Object $record -Name 'IsContainer'
-    if ($null -ne $exists) { $result.Exists = [bool]$exists }
-    if ($null -ne $isContainer) { $result.IsContainer = [bool]$isContainer }
+    # Existence is only evidence when the provider states it as a literal
+    # Boolean. A non Boolean statement (for example the string 'false') is not
+    # proof that the path exists, and reading it as one would let a path whose
+    # existence was never proven pass the separation checks.
+    if ($exists -is [bool]) { $result.Exists = [bool]$exists }
+    if ($isContainer -is [bool]) { $result.IsContainer = [bool]$isContainer }
     if (-not $result.Exists -or -not $result.IsContainer) {
         $result.ReasonCode = 'PathMissing'
         return $result
@@ -731,8 +735,13 @@ function Test-DestinationSafety {
         return $decision
     }
     $decision.DestinationIdentityKeys = @(Get-RecoveryIdentityKeys -Identity $fresh)
+    # A source identity is only usable when it positively states that it was
+    # resolved: the literal Boolean true. An absent or non Boolean statement is
+    # not a claim of resolution, and treating it as one would let a source whose
+    # physical identity was never proven compare against the destination.
     $sourceResolved = Get-RecoveryMemberValue -Object $SourceIdentity -Name 'Resolved'
-    if ($null -eq $SourceIdentity -or (Get-RecoveryMemberValue -Object $SourceIdentity -Name 'IsIndeterminate') -eq $true -or $sourceResolved -eq $false) {
+    $sourceResolvedIsLiteral = (($sourceResolved -is [bool]) -and ($sourceResolved -eq $true))
+    if ($null -eq $SourceIdentity -or (Get-RecoveryMemberValue -Object $SourceIdentity -Name 'IsIndeterminate') -eq $true -or -not $sourceResolvedIsLiteral) {
         $decision.ReasonCode = 'SourceIndeterminate'
         return $decision
     }
@@ -833,7 +842,10 @@ function Get-RecoveryDestinationSpace {
 function Select-DestinationFolder {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][object]$PickerProvider,
+        # A null picker is not an error: the typed path is a first-class
+        # documented selection method, so a caller that only wired the typed
+        # provider still gets a selection attempt.
+        [Parameter()][AllowNull()][object]$PickerProvider = $null,
         [object]$TypedPathProvider = $null
     )
     $result = [pscustomobject]@{ Selected = $false; Path = $null; Method = $null; ReasonCode = 'DestinationNotSelected'; Message = $null }

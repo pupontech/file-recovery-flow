@@ -1027,3 +1027,179 @@ Describe 'RecoveryAutomation production disk provider topology' {
         $identity.ReasonCode | Should -Be 'MembersIncomplete'
     }
 }
+
+Describe 'Default front door and case cleanup (runtime regression)' {
+
+    BeforeAll {
+        $script:FrontDoorRunnable = $true
+        if ($env:OS -eq 'Windows_NT') {
+            $frontDoorIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+            $frontDoorPrincipal = New-Object System.Security.Principal.WindowsPrincipal($frontDoorIdentity)
+            $script:FrontDoorRunnable = [bool]$frontDoorPrincipal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+        }
+
+        function New-FrontDoorFixture {
+            param([string]$Name)
+            $sourcePath = Join-Path -Path $TestDrive -ChildPath ('frontdoor-source-' + $Name)
+            $destinationPath = Join-Path -Path $TestDrive -ChildPath ('frontdoor-destination-' + $Name)
+            New-Item -ItemType Directory -Path $sourcePath -Force | Out-Null
+            New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null
+            $filePath = Join-Path -Path $TestDrive -ChildPath ('frontdoor-file-scavenger-' + $Name + '.bin')
+            $rStudioPath = Join-Path -Path $TestDrive -ChildPath ('frontdoor-r-studio-' + $Name + '.bin')
+            Set-Content -LiteralPath $filePath -Value 'fixture' -Encoding ASCII
+            Set-Content -LiteralPath $rStudioPath -Value 'fixture' -Encoding ASCII
+
+            $disks = @(
+                [pscustomobject]@{ DiskNumber = 4; UniqueId = 'FRONTDOOR-SOURCE-DISK'; UniqueIdFormat = 'WWN'; SerialNumber = 'FRONTDOOR-SOURCE-SERIAL'; Model = 'Source'; SizeBytes = 1000000 }
+                [pscustomobject]@{ DiskNumber = 5; UniqueId = 'FRONTDOOR-DESTINATION-DISK'; UniqueIdFormat = 'WWN'; SerialNumber = 'FRONTDOOR-DESTINATION-SERIAL'; Model = 'Destination'; SizeBytes = 2000000 }
+            )
+            $diskProvider = @{
+                Name = 'FrontDoorFixture'
+                GetDisks = {
+                    param($request)
+                    foreach ($disk in $disks) {
+                        if ([int]$disk.DiskNumber -eq [int]$request.DiskNumber) { return $disk }
+                    }
+                    return $null
+                }.GetNewClosure()
+                ResolvePath = {
+                    param($request)
+                    $isSource = ([string]$request.Path -eq [string]$sourcePath)
+                    return [pscustomobject]@{
+                        CanonicalPath = [string]$request.Path
+                        Exists = $true
+                        IsContainer = $true
+                        ReparseResolved = $true
+                        IsReparsePoint = $false
+                        MembersIncomplete = $false
+                        DiskNumber = if ($isSource) { 4 } else { 5 }
+                        PartitionNumber = 1
+                        VolumeGuid = if ($isSource) { 'FRONTDOOR-SOURCE-VOLUME' } else { 'FRONTDOOR-DESTINATION-VOLUME' }
+                        VolumePath = if ($isSource) { 'FRONTDOOR-SOURCE-VOLUME-PATH' } else { 'FRONTDOOR-DESTINATION-VOLUME-PATH' }
+                        DriveLetter = $null
+                    }
+                }.GetNewClosure()
+                GetFreeSpace = {
+                    param($request)
+                    return [pscustomobject]@{ VolumeAvailableBytes = 1000000000; UserAvailableBytes = 1000000000 }
+                }.GetNewClosure()
+            }
+            $candidateProvider = {
+                param($product, $explicitPath)
+                if ($product -eq 'FileScavenger') {
+                    return [pscustomobject]@{
+                        Path = $explicitPath
+                        Exists = $true
+                        Readable = $true
+                        FileVersion = '7.1.1.13'
+                        ProductVersion = '7.1.1.13'
+                        ProductName = 'File Scavenger'
+                        OriginalFilename = 'frontdoor-file-scavenger.bin'
+                        EvidenceSource = 'IntegrationFixture'
+                    }
+                }
+                return [pscustomobject]@{
+                    Path = $explicitPath
+                    Exists = $true
+                    Readable = $true
+                    FileVersion = '9.5.191810'
+                    ProductVersion = '9.5.191810'
+                    ProductName = 'R-Studio'
+                    OriginalFilename = 'frontdoor-r-studio.bin'
+                    CompanyName = 'R-Tools Technology Inc.'
+                    OwnerValidated = $true
+                    OwnerEvidence = 'IntegrationFixture'
+                    EvidenceSource = 'FileVersionInfo: IntegrationFixture'
+                }
+            }.GetNewClosure()
+            $fileRunner = {
+                param($path)
+                return [pscustomobject]@{ Path = $path; Pid = 4871; StartTime = '2026-01-01T00:00:00Z' }
+            }.GetNewClosure()
+
+            return [pscustomobject]@{
+                SourcePath        = $sourcePath
+                DestinationPath   = $destinationPath
+                FilePath          = $filePath
+                RStudioPath       = $rStudioPath
+                DiskProvider      = $diskProvider
+                CandidateProvider = $candidateProvider
+                FileRunner        = $fileRunner
+            }
+        }
+    }
+
+    It 'selects the destination from the typed provider when no graphical picker is wired' {
+        $fixture = New-FrontDoorFixture -Name 'typed'
+        $typedCalls = New-Object System.Collections.Generic.List[string]
+        $typedProvider = {
+            param($request)
+            $typedCalls.Add('ReadPath') | Out-Null
+            return $fixture.DestinationPath
+        }.GetNewClosure()
+
+        $result = Invoke-RecoveryAutomation -ConfigPath $script:ConfigPath -NoPause `
+            -SourcePath $fixture.SourcePath `
+            -ConfigurationOverrides @{ FileScavengerPath = $fixture.FilePath; RStudioPath = $fixture.RStudioPath; ClientName = 'Typed Client' } `
+            -SourceProtectionProvider { return $true } -DiskProvider $fixture.DiskProvider `
+            -FileScavengerDiscoveryProvider $fixture.CandidateProvider -RStudioDiscoveryProvider $fixture.CandidateProvider `
+            -ValidatedFileScavengerBuilds @('7.1.1.13') -ValidatedRStudioBuilds @('9.5.191810') `
+            -RuntimeProvider { return @{ Compatible = $true; Evidence = 'IntegrationFixture' } } `
+            -ElevationProvider { return $true } -FileScavengerProcessRunner $fixture.FileRunner `
+            -TypedDestinationProvider $typedProvider
+
+        $result.ReasonCode | Should -Not -Be 'DestinationNotSelected'
+        $result.ReasonCode | Should -Be 'ManualGatePending'
+        $typedCalls.Count | Should -Be 1
+        $result.JobFolderPath | Should -Not -BeNullOrEmpty
+        ([string]$result.JobFolderPath).StartsWith([string]$fixture.DestinationPath) | Should -BeTrue
+    }
+
+    It 'releases the case event log handle when the workflow returns' {
+        $fixture = New-FrontDoorFixture -Name 'logclose'
+
+        $result = Invoke-RecoveryAutomation -ConfigPath $script:ConfigPath -NoPause `
+            -SourcePath $fixture.SourcePath -DestinationPath $fixture.DestinationPath `
+            -ConfigurationOverrides @{ FileScavengerPath = $fixture.FilePath; RStudioPath = $fixture.RStudioPath; ClientName = 'Log Close Client' } `
+            -SourceProtectionProvider { return $true } -DiskProvider $fixture.DiskProvider `
+            -FileScavengerDiscoveryProvider $fixture.CandidateProvider -RStudioDiscoveryProvider $fixture.CandidateProvider `
+            -ValidatedFileScavengerBuilds @('7.1.1.13') -ValidatedRStudioBuilds @('9.5.191810') `
+            -RuntimeProvider { return @{ Compatible = $true; Evidence = 'IntegrationFixture' } } `
+            -ElevationProvider { return $true } -FileScavengerProcessRunner $fixture.FileRunner
+
+        $result.ReasonCode | Should -Be 'ManualGatePending'
+        (Test-Path -LiteralPath $result.LogPath -PathType Leaf) | Should -BeTrue
+
+        # The case log is opened with FileShare.Read. An exclusive open only
+        # succeeds once the workflow released the writer handle, which is the
+        # exact condition Pester TestDrive cleanup needs on Windows.
+        $exclusive = $null
+        $opened = $false
+        try {
+            $exclusive = [System.IO.File]::Open([string]$result.LogPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+            $opened = $true
+        }
+        finally {
+            if ($null -ne $exclusive) { $exclusive.Dispose() }
+        }
+        $opened | Should -BeTrue
+    }
+
+    It 'forwards technician inputs and records interactive wiring through the real entry point' {
+        if (-not $script:FrontDoorRunnable) {
+            Set-ItResult -Skipped -Because 'the front door relaunches through UAC on a non-elevated Windows host'
+            return
+        }
+
+        $result = & $script:EntryPoint -ConfigPath $script:ConfigPath -NoPause -DryRun `
+            -ClientName 'CLI forwarding probe' -DestinationPath 'D:\Recovery'
+
+        $result.Success | Should -BeTrue
+        $result.Mode | Should -Be 'DryRun'
+        $result.Configuration.ClientName | Should -Be 'CLI forwarding probe'
+        $result.Configuration.DestinationRoot | Should -Be 'D:\Recovery'
+        $selectorEntry = @($result.FrontDoorWiring) | Where-Object { $_.Name -eq 'SourceSelector' }
+        $null -ne $selectorEntry | Should -BeTrue
+        $selectorEntry.Source | Should -Be 'InteractiveDefault'
+    }
+}

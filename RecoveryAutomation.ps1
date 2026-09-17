@@ -65,7 +65,10 @@ function Get-RecoveryAutomationElevationArgumentLine {
         [Parameter(Mandatory = $true)][string]$ScriptPath,
         [string]$ConfigPath = '',
         [switch]$NoPause,
-        [switch]$DryRun
+        [switch]$DryRun,
+        [string]$SourcePath = '',
+        [string]$DestinationPath = '',
+        [string]$ClientName = ''
     )
 
     if ([string]::IsNullOrWhiteSpace($ScriptPath)) {
@@ -77,6 +80,18 @@ function Get-RecoveryAutomationElevationArgumentLine {
     }
     if ($NoPause) { $arguments += '-NoPause' }
     if ($DryRun) { $arguments += '-DryRun' }
+    # Explicit technician inputs survive the elevated relaunch. Only values the
+    # caller actually supplied are forwarded, so an unset value keeps the
+    # configuration fallback instead of being replaced with an empty override.
+    if (-not [string]::IsNullOrWhiteSpace($SourcePath)) {
+        $arguments += @('-SourcePath', ('"' + $SourcePath + '"'))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($DestinationPath)) {
+        $arguments += @('-DestinationPath', ('"' + $DestinationPath + '"'))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ClientName)) {
+        $arguments += @('-ClientName', ('"' + $ClientName + '"'))
+    }
     return ($arguments -join ' ')
 }
 
@@ -86,7 +101,10 @@ function Invoke-RecoveryAutomationSelfElevation {
         [Parameter(Mandatory = $true)][string]$ScriptPath,
         [string]$ConfigPath = '',
         [switch]$NoPause,
-        [switch]$DryRun
+        [switch]$DryRun,
+        [string]$SourcePath = '',
+        [string]$DestinationPath = '',
+        [string]$ClientName = ''
     )
 
     if ($env:OS -ne 'Windows_NT' -or (Test-RecoveryAutomationHostElevated)) {
@@ -102,7 +120,8 @@ function Invoke-RecoveryAutomationSelfElevation {
     try {
         $powershellPath = [System.IO.Path]::Combine($PSHOME, 'powershell.exe')
         $argumentLine = Get-RecoveryAutomationElevationArgumentLine -ScriptPath $ScriptPath `
-            -ConfigPath $ConfigPath -NoPause:$NoPause -DryRun:$DryRun
+            -ConfigPath $ConfigPath -NoPause:$NoPause -DryRun:$DryRun `
+            -SourcePath $SourcePath -DestinationPath $DestinationPath -ClientName $ClientName
         $child = Start-Process -FilePath $powershellPath -ArgumentList $argumentLine `
             -Verb RunAs -WorkingDirectory $PSScriptRoot -Wait -PassThru -ErrorAction Stop
         if ($null -eq $child) {
@@ -692,7 +711,21 @@ function Get-RecoveryAutomationSourceSelection {
             }
         }
     }
-    return [pscustomobject]@{ Selected = $false; Path = $null; Evidence = 'The source selector returned no usable path.'; Raw = $raw; ReasonCode = 'SourceNotSelected' }
+    return [pscustomobject]@{ Selected = $false; Path = $null; Evidence = (Get-RecoveryAutomationSelectorEvidence -Raw $raw); Raw = $raw; ReasonCode = 'SourceNotSelected' }
+}
+
+function Get-RecoveryAutomationSelectorEvidence {
+    [CmdletBinding()]
+    param([AllowNull()][object]$Raw)
+
+    # The selector's own evidence text is preserved for the technician when the
+    # selection fails, so a cancelled or unavailable picker is distinguishable
+    # from a selector that was never supplied.
+    $evidence = Get-RecoveryAutomationValue -InputObject $Raw -Names @('Evidence', 'Reason', 'Message')
+    if ($null -eq $evidence -or [string]::IsNullOrWhiteSpace([string]$evidence)) {
+        return 'The source selector returned no usable path.'
+    }
+    return [string]$evidence
 }
 
 function Test-RecoveryAutomationSourceProtection {
@@ -703,30 +736,94 @@ function Test-RecoveryAutomationSourceProtection {
         [scriptblock]$Provider = $null
     )
 
+    # Every verified result carries an EvidenceKind so the record distinguishes
+    # an explicit operator attestation from a measured read-only/write-blocker
+    # observation. The default front door can only ever produce an attestation;
+    # a measurement has to arrive through a provider that reports one.
     $selectionValues = @(
         Get-RecoveryAutomationValue -InputObject $Selection -Names @('ReadOnlyVerified', 'WriteBlocked', 'SourceProtected', 'HardwareWriteBlocked')
     )
     foreach ($value in $selectionValues) {
         if (Test-RecoveryAutomationBoolean $value) {
-            return [pscustomobject]@{ Verified = $true; Evidence = 'Source selection included read-only/write-blocker evidence.'; ReasonCode = $null; Raw = $Selection }
+            return [pscustomobject]@{ Verified = $true; Evidence = 'Source selection included read-only/write-blocker evidence.'; EvidenceKind = 'SelectionDeclared'; ReasonCode = $null; Raw = $Selection }
         }
     }
     if ($null -eq $Provider) {
-        return [pscustomobject]@{ Verified = $false; Evidence = 'No read-only or write-blocker evidence was supplied.'; ReasonCode = 'SourceProtectionUnverified'; Raw = $null }
+        return [pscustomobject]@{ Verified = $false; Evidence = 'No read-only or write-blocker evidence was supplied.'; EvidenceKind = 'Unspecified'; ReasonCode = 'SourceProtectionUnverified'; Raw = $null }
     }
     try {
         $raw = & $Provider ([pscustomobject]@{ Purpose = 'SourceProtection'; Path = $Path; Selection = $Selection })
     }
     catch {
-        return [pscustomobject]@{ Verified = $false; Evidence = $_.Exception.Message; ReasonCode = 'SourceProtectionCheckFailed'; Raw = $null }
+        return [pscustomobject]@{ Verified = $false; Evidence = $_.Exception.Message; EvidenceKind = 'Unspecified'; ReasonCode = 'SourceProtectionCheckFailed'; Raw = $null }
     }
     if ($raw -is [bool]) {
-        return [pscustomobject]@{ Verified = [bool]$raw; Evidence = 'Source protection provider Boolean result.'; ReasonCode = if ($raw) { $null } else { 'SourceProtectionUnverified' }; Raw = $raw }
+        return [pscustomobject]@{ Verified = [bool]$raw; Evidence = 'Source protection provider Boolean result.'; EvidenceKind = 'ProviderDeclared'; ReasonCode = if ($raw) { $null } else { 'SourceProtectionUnverified' }; Raw = $raw }
     }
     $verified = Get-RecoveryAutomationValue -InputObject $raw -Names @('Verified', 'ReadOnlyVerified', 'WriteBlocked', 'SourceProtected', 'HardwareWriteBlocked')
     $evidence = Get-RecoveryAutomationValue -InputObject $raw -Names @('Evidence', 'Message', 'Reason')
+    $reportedKind = Get-RecoveryAutomationValue -InputObject $raw -Names @('EvidenceKind', 'AttestationKind', 'Kind')
+    $evidenceKind = 'ProviderDeclared'
+    if ($null -ne $reportedKind -and -not [string]::IsNullOrWhiteSpace([string]$reportedKind)) {
+        $kindText = [string]$reportedKind
+        if ($kindText.ToLowerInvariant().Contains('attest')) { $evidenceKind = 'OperatorAttestation' }
+        elseif ($kindText.ToLowerInvariant().Contains('measured')) { $evidenceKind = 'MeasuredState' }
+        else { $evidenceKind = $kindText }
+    }
     $isVerified = Test-RecoveryAutomationBoolean $verified
-    return [pscustomobject]@{ Verified = $isVerified; Evidence = $evidence; ReasonCode = if ($isVerified) { $null } else { 'SourceProtectionUnverified' }; Raw = $raw }
+    return [pscustomobject]@{ Verified = $isVerified; Evidence = $evidence; EvidenceKind = $evidenceKind; ReasonCode = if ($isVerified) { $null } else { 'SourceProtectionUnverified' }; Raw = $raw }
+}
+
+function Get-RecoveryAutomationFrontDoorWiring {
+    [CmdletBinding()]
+    param(
+        [scriptblock]$SourceSelector = $null,
+        [scriptblock]$SourceProtectionProvider = $null,
+        [scriptblock]$DestinationPickerProvider = $null,
+        [scriptblock]$TypedDestinationProvider = $null,
+        [scriptblock]$InteractionProvider = $null,
+        [scriptblock]$ClientNameProvider = $null
+    )
+
+    # The default front door wires the documented interactive seams when none
+    # were injected, so a launcher double-click is a usable workflow instead of
+    # a dead end. Injection always wins. Nothing here decides a safety question:
+    # every provider answers through the same validation an injected seam uses.
+    # Source protection stays an explicit technician step - the default provider
+    # records an operator attestation, never a measured observation.
+    Import-RecoveryAutomationModules
+
+    $evidence = New-Object System.Collections.ArrayList
+    $plan = @(
+        [pscustomobject]@{ Name = 'SourceSelector'; Value = $SourceSelector; DefaultName = 'SourceSelectorProvider' },
+        [pscustomobject]@{ Name = 'SourceProtectionProvider'; Value = $SourceProtectionProvider; DefaultName = 'SourceProtectionAttestationProvider' },
+        [pscustomobject]@{ Name = 'DestinationPickerProvider'; Value = $DestinationPickerProvider; DefaultName = 'PickerProvider' },
+        [pscustomobject]@{ Name = 'TypedDestinationProvider'; Value = $TypedDestinationProvider; DefaultName = 'TypedPathProvider' },
+        [pscustomobject]@{ Name = 'InteractionProvider'; Value = $InteractionProvider; DefaultName = 'InteractionProvider' },
+        [pscustomobject]@{ Name = 'ClientNameProvider'; Value = $ClientNameProvider; DefaultName = 'ClientNameProvider' }
+    )
+    $resolved = @{}
+    foreach ($entry in $plan) {
+        $source = 'InteractiveDefault'
+        $provider = $entry.Value
+        if ($null -ne $provider) {
+            $source = 'Injected'
+        }
+        else {
+            $provider = TechnicianUi\Get-TechnicianUiDefaultProvider -Name $entry.DefaultName
+        }
+        $resolved[$entry.Name] = $provider
+        [void]$evidence.Add([pscustomobject]@{ Name = $entry.Name; Source = $source; DefaultName = $entry.DefaultName })
+    }
+    return [pscustomobject]@{
+        SourceSelector            = $resolved['SourceSelector']
+        SourceProtectionProvider  = $resolved['SourceProtectionProvider']
+        DestinationPickerProvider = $resolved['DestinationPickerProvider']
+        TypedDestinationProvider  = $resolved['TypedDestinationProvider']
+        InteractionProvider       = $resolved['InteractionProvider']
+        ClientNameProvider        = $resolved['ClientNameProvider']
+        Evidence                  = $evidence.ToArray()
+    }
 }
 
 function Write-RecoveryAutomationMetadata {
@@ -1967,6 +2064,7 @@ function Invoke-RecoveryAutomation {
         [scriptblock]$RStudioFreshEvidenceProvider = $null,
         [scriptblock]$RStudioActivationProvider = $null,
         [scriptblock]$InteractionProvider = $null,
+        [scriptblock]$ClientNameProvider = $null,
         [object]$LogWriterProvider = $null,
         [object]$StateWriterProvider = $null,
         [object]$ClaimProvider = $null,
@@ -2139,7 +2237,10 @@ function Invoke-RecoveryAutomation {
             if ($null -ne $TypedDestinationProvider) {
                 $typedPicker = @{ ReadPath = { param($request) & $TypedDestinationProvider $request }.GetNewClosure() }
             }
-            if ($null -ne $picker) {
+            # The typed path is a first-class documented selection method: it is
+            # tried whenever either provider is available, not only when a
+            # graphical picker happens to be wired.
+            if ($null -ne $picker -or $null -ne $typedPicker) {
                 $selection = DiskDetection\Select-DestinationFolder -PickerProvider $picker -TypedPathProvider $typedPicker
                 if ($selection.Selected) { $destinationText = $selection.Path }
             }
@@ -2178,6 +2279,31 @@ function Invoke-RecoveryAutomation {
 
         $effectiveClientName = $ClientName
         if ([string]::IsNullOrWhiteSpace($effectiveClientName)) { $effectiveClientName = [string]$configurationResult.Configuration.ClientName }
+        if ([string]::IsNullOrWhiteSpace($effectiveClientName) -and $null -ne $ClientNameProvider) {
+            # Explicit technician input: the default front door asks instead of
+            # inventing a name. Validation is unchanged and still fail-closed:
+            # an empty, cancelled, reserved, or unusable answer ends in the same
+            # ClientNameInvalid path, and sanitizing stays in New-RecoveryJobFolder.
+            $clientPrompt = $null
+            try {
+                $clientPrompt = & $ClientNameProvider ([pscustomobject]@{ Purpose = 'ClientName'; Configuration = $configurationResult.Configuration })
+            }
+            catch {
+                $clientPrompt = $null
+            }
+            if ($null -ne $clientPrompt) {
+                if ($clientPrompt -is [string]) {
+                    $effectiveClientName = ([string]$clientPrompt).Trim()
+                }
+                else {
+                    $cancelled = Get-RecoveryAutomationValue -InputObject $clientPrompt -Names @('Cancelled')
+                    $promptedName = Get-RecoveryAutomationValue -InputObject $clientPrompt -Names @('ClientName', 'Name', 'Answer')
+                    if ((Test-RecoveryAutomationBoolean $cancelled) -ne $true -and $null -ne $promptedName) {
+                        $effectiveClientName = ([string]$promptedName).Trim()
+                    }
+                }
+            }
+        }
         if ([string]::IsNullOrWhiteSpace($effectiveClientName)) {
             return New-RecoveryAutomationResult -Success $false -ExitCode 5 -Mode 'Case' `
                 -ReasonCode 'ClientNameInvalid' -Message 'A client name is required before a job folder can be claimed.' `
@@ -2519,11 +2645,29 @@ function Invoke-RecoveryAutomation {
             -Runtime $runtime -Applications $applications -SourceIdentity $sourceIdentity `
             -DestinationIdentity $destinationIdentity -Capacity $capacity -Case $case -State $state
     }
+    finally {
+        # The case log is opened with FileShare.Read, so on Windows the events
+        # file stays locked until this close runs. Every return path above,
+        # including early refusals and the unhandled-error path, releases the
+        # handle so the case folder can be archived, moved, or cleaned up.
+        if ($null -ne $logHandle) {
+            try {
+                $closeResult = RecoveryLogging\Close-RecoveryLog -Writer $logHandle
+                if ($null -eq $closeResult -or $closeResult.Success -ne $true) {
+                    Write-Warning 'The case event log handle could not be closed cleanly.'
+                }
+            }
+            catch {
+                Write-Warning ('The case event log handle could not be closed cleanly: ' + $_.Exception.Message)
+            }
+        }
+    }
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
     $elevationLaunch = Invoke-RecoveryAutomationSelfElevation -ScriptPath $PSCommandPath `
-        -ConfigPath $RecoveryConfigPath -NoPause:$NoPause -DryRun:$DryRun
+        -ConfigPath $RecoveryConfigPath -NoPause:$NoPause -DryRun:$DryRun `
+        -SourcePath $SourcePath -DestinationPath $DestinationPath -ClientName $ClientName
     if ($elevationLaunch.ShouldExit) {
         if ($elevationLaunch.Success) {
             exit $elevationLaunch.ExitCode
@@ -2534,7 +2678,36 @@ if ($MyInvocation.InvocationName -ne '.') {
         Write-Output $elevationResult
         exit $elevationResult.ExitCode
     }
-    $entryResult = Invoke-RecoveryAutomation -ConfigPath $RecoveryConfigPath -NoPause:$NoPause -DryRun:$DryRun
+
+    # Default front door: wire the documented interactive seams when nothing was
+    # injected so the launcher is a usable workflow, then forward every value the
+    # caller actually supplied. An unsupplied value is never forwarded as an
+    # empty override, so the configuration fallback survives.
+    $frontDoorWiring = Get-RecoveryAutomationFrontDoorWiring `
+        -SourceSelector $SourceSelector -SourceProtectionProvider $SourceProtectionProvider `
+        -DestinationPickerProvider $DestinationPickerProvider -TypedDestinationProvider $TypedDestinationProvider `
+        -InteractionProvider $InteractionProvider
+    $frontDoorArguments = @{
+        ConfigPath                = $RecoveryConfigPath
+        NoPause                   = $NoPause.IsPresent
+        DryRun                    = $DryRun.IsPresent
+        SourceSelector            = $frontDoorWiring.SourceSelector
+        SourceProtectionProvider  = $frontDoorWiring.SourceProtectionProvider
+        DestinationPickerProvider = $frontDoorWiring.DestinationPickerProvider
+        TypedDestinationProvider  = $frontDoorWiring.TypedDestinationProvider
+        InteractionProvider       = $frontDoorWiring.InteractionProvider
+        ClientNameProvider        = $frontDoorWiring.ClientNameProvider
+    }
+    foreach ($boundName in @($PSBoundParameters.Keys)) {
+        if ($boundName -eq 'RecoveryConfigPath') { continue }
+        $boundValue = $PSBoundParameters[$boundName]
+        if ($boundValue -is [string] -and [string]::IsNullOrWhiteSpace($boundValue)) { continue }
+        $frontDoorArguments[$boundName] = $boundValue
+    }
+    $entryResult = Invoke-RecoveryAutomation @frontDoorArguments
+    if ($null -ne $entryResult) {
+        $entryResult | Add-Member -NotePropertyName FrontDoorWiring -NotePropertyValue @($frontDoorWiring.Evidence) -Force
+    }
     Write-Output $entryResult
     exit $entryResult.ExitCode
 }

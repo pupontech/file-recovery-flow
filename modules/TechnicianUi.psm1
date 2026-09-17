@@ -1016,7 +1016,8 @@ function Get-TechnicianUiDefaultProvider {
     param(
         [Parameter(Mandatory = $true)]
         [ValidateSet('PickerProvider', 'TypedPathProvider', 'InteractionProvider', 'HandoffPanelProvider',
-            'ClipboardProvider', 'ExplorerProvider', 'DisplayProvider')]
+            'ClipboardProvider', 'ExplorerProvider', 'DisplayProvider', 'SourceSelectorProvider',
+            'SourceProtectionAttestationProvider', 'ClientNameProvider')]
         [string]$Name
     )
 
@@ -1075,6 +1076,96 @@ function Get-TechnicianUiDefaultProvider {
                 Write-Host ('Safe default: ' + $Request.SafeDefault)
                 $answer = Read-Host -Prompt 'Enter one of the listed choices'
                 return [pscustomobject]@{ Response = $answer; Cancelled = $false; TimedOut = $false }
+            }
+        }
+        'SourceSelectorProvider' {
+            # Explicit technician source input for the default front door. The
+            # documented folder browser answers first; the typed prompt is the
+            # fallback, exactly like destination selection. The selector never
+            # infers, enumerates, or scans a device, and it never claims
+            # read-only protection: source protection evidence is a separate,
+            # explicit step (SourceProtectionAttestationProvider).
+            return {
+                param($Request)
+                $picker = Get-TechnicianUiDefaultProvider -Name 'PickerProvider'
+                $typed = Get-TechnicianUiDefaultProvider -Name 'TypedPathProvider'
+                $pickerRequest = [pscustomobject]@{
+                    Description         = 'Select the read-only source to recover from.'
+                    ShowNewFolderButton = $false
+                    Purpose             = 'SourceSelection'
+                }
+                $pickerResult = $null
+                try { $pickerResult = & $picker $pickerRequest } catch { $pickerResult = $null }
+                if ($null -ne $pickerResult) {
+                    if ($pickerResult -is [string]) {
+                        if (-not [string]::IsNullOrWhiteSpace($pickerResult)) {
+                            return [pscustomobject]@{ Selected = $true; Path = ([string]$pickerResult).Trim(); SelectionMethod = 'Picker'; Evidence = 'Technician selected the source in the folder browser.' }
+                        }
+                    }
+                    else {
+                        $pickerPath = Get-TUObjectPropertyValue -InputObject $pickerResult -Names @('Path', 'SelectedPath')
+                        $pickerDecision = Get-TUObjectPropertyValue -InputObject $pickerResult -Names @('Decision', 'Result')
+                        if (-not [string]::IsNullOrWhiteSpace([string]$pickerPath)) {
+                            return [pscustomobject]@{ Selected = $true; Path = ([string]$pickerPath).Trim(); SelectionMethod = 'Picker'; Evidence = 'Technician selected the source in the folder browser.' }
+                        }
+                        if ($null -ne $pickerDecision -and ([string]$pickerDecision).ToUpperInvariant() -eq 'CANCELLED') {
+                            return [pscustomobject]@{ Selected = $false; Path = $null; SelectionMethod = 'Picker'; Evidence = 'The technician cancelled the source folder selection.' }
+                        }
+                    }
+                }
+                $typedResult = $null
+                try { $typedResult = & $typed ([pscustomobject]@{ Description = 'Source selection.' }) } catch { $typedResult = $null }
+                $typedPath = $null
+                if ($typedResult -is [string]) { $typedPath = [string]$typedResult }
+                elseif ($null -ne $typedResult) { $typedPath = Get-TUObjectPropertyValue -InputObject $typedResult -Names @('Path') }
+                if (-not [string]::IsNullOrWhiteSpace([string]$typedPath)) {
+                    return [pscustomobject]@{ Selected = $true; Path = ([string]$typedPath).Trim(); SelectionMethod = 'TypedPath'; Evidence = 'Technician typed the source path.' }
+                }
+                return [pscustomobject]@{ Selected = $false; Path = $null; SelectionMethod = $null; Evidence = 'No source path was provided through the folder browser or the typed prompt.' }
+            }
+        }
+        'SourceProtectionAttestationProvider' {
+            # Explicit, fail-closed operator attestation for source protection.
+            # It never measures the interface, never opens the device, and never
+            # claims measured state: the recorded evidence is labeled an operator
+            # attestation and is deliberately distinguishable from a measured
+            # read-only or write-blocker observation. Anything other than the
+            # exact confirmation word is a refusal.
+            return {
+                param($Request)
+                Write-Host ''
+                Write-Host ('Source protection evidence for: ' + [string]$Request.Path)
+                Write-Host 'This records an OPERATOR ATTESTATION, not a measurement.'
+                Write-Host 'Confirm only if a hardware write blocker (or a documented read-only state) protects this source.'
+                $answer = Read-Host -Prompt 'Type ATTEST to record the operator attestation, or anything else to refuse'
+                if ([string]$answer -eq 'ATTEST') {
+                    return [pscustomobject]@{
+                        Verified     = $true
+                        EvidenceKind = 'OperatorAttestation'
+                        Evidence     = 'Operator attestation: a hardware write blocker or documented read-only state protects the selected source.'
+                    }
+                }
+                return [pscustomobject]@{
+                    Verified     = $false
+                    EvidenceKind = 'OperatorAttestation'
+                    Evidence     = 'The operator did not confirm source protection, so no protection evidence is recorded.'
+                }
+            }
+        }
+        'ClientNameProvider' {
+            # Explicit technician client input. The answer is returned as typed;
+            # sanitizing and validation stay in the case-creation path
+            # (Convert-RecoveryName), which remains fail-closed for empty,
+            # reserved, or unusable names.
+            return {
+                param($Request)
+                Write-Host ''
+                Write-Host 'A client name is required before a job folder can be claimed.'
+                $answer = Read-Host -Prompt 'Type the client name for this case'
+                if ([string]::IsNullOrWhiteSpace([string]$answer)) {
+                    return [pscustomobject]@{ ClientName = $null; Cancelled = $true; Evidence = 'No client name was entered.' }
+                }
+                return [pscustomobject]@{ ClientName = ([string]$answer).Trim(); Cancelled = $false; Evidence = 'Client name entered by the technician.' }
             }
         }
         'DisplayProvider' {
