@@ -7,6 +7,7 @@ param(
     [string]$SourcePath = '',
     [string]$DestinationPath = '',
     [string]$ClientName = '',
+    [string]$ResumeJobPath = '',
     [object]$ConfigurationOverrides = $null,
     [object]$DiskProvider = $null,
     [scriptblock]$SourceSelector = $null,
@@ -67,6 +68,7 @@ function Get-RecoveryAutomationElevationArgumentLine {
         [string]$SourcePath = '',
         [string]$DestinationPath = '',
         [string]$ClientName = '',
+        [string]$ResumeJobPath = '',
         [switch]$NoPause,
         [switch]$DryRun
     )
@@ -83,7 +85,8 @@ function Get-RecoveryAutomationElevationArgumentLine {
             [pscustomobject]@{ Name = 'ConfigPath'; Value = $ConfigPath }
             [pscustomobject]@{ Name = 'SourcePath'; Value = $SourcePath }
             [pscustomobject]@{ Name = 'DestinationPath'; Value = $DestinationPath }
-            [pscustomobject]@{ Name = 'ClientName'; Value = $ClientName })) {
+            [pscustomobject]@{ Name = 'ClientName'; Value = $ClientName }
+            [pscustomobject]@{ Name = 'ResumeJobPath'; Value = $ResumeJobPath })) {
         if (-not [string]::IsNullOrEmpty([string]$candidate.Value) -and ([string]$candidate.Value).Contains('"')) {
             throw ('The value supplied for ' + $candidate.Name + ' contains a double quote, which cannot be forwarded through the elevated relaunch.')
         }
@@ -103,6 +106,9 @@ function Get-RecoveryAutomationElevationArgumentLine {
     }
     if (-not [string]::IsNullOrWhiteSpace($ClientName)) {
         $arguments += @('-ClientName', ('"' + $ClientName + '"'))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ResumeJobPath)) {
+        $arguments += @('-ResumeJobPath', ('"' + $ResumeJobPath + '"'))
     }
     if ($NoPause) { $arguments += '-NoPause' }
     if ($DryRun) { $arguments += '-DryRun' }
@@ -141,6 +147,7 @@ function Invoke-RecoveryAutomationSelfElevation {
         [string]$SourcePath = '',
         [string]$DestinationPath = '',
         [string]$ClientName = '',
+        [string]$ResumeJobPath = '',
         [switch]$NoPause,
         [switch]$DryRun,
         [switch]$SkipElevation
@@ -174,7 +181,8 @@ function Invoke-RecoveryAutomationSelfElevation {
         $powershellPath = Get-RecoveryAutomationHostExecutablePath
         $argumentLine = Get-RecoveryAutomationElevationArgumentLine -ScriptPath $ScriptPath `
             -ConfigPath $ConfigPath -NoPause:$NoPause -DryRun:$DryRun `
-            -SourcePath $SourcePath -DestinationPath $DestinationPath -ClientName $ClientName
+            -SourcePath $SourcePath -DestinationPath $DestinationPath -ClientName $ClientName `
+            -ResumeJobPath $ResumeJobPath
         $child = Start-Process -FilePath $powershellPath -ArgumentList $argumentLine `
             -Verb RunAs -WorkingDirectory $PSScriptRoot -Wait -PassThru -ErrorAction Stop
         if ($null -eq $child) {
@@ -2445,6 +2453,467 @@ function Invoke-RecoveryAutomationHandoff {
     }
 }
 
+function New-RecoveryAutomationCaseEventWriter {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][AllowNull()][object]$LogHandle,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [AllowNull()][object]$StateWriter = $null
+    )
+
+    # The durable event boundary of one case. The fresh case path and the resume
+    # path both write through this writer, so the rule holds for both: the event is
+    # appended and flushed, the writer must report a strictly newer durable
+    # sequence, the state adopts that exact sequence, and only then is the snapshot
+    # written. A writer that refuses leaves the snapshot untouched, so no later
+    # step can treat the boundary as recorded.
+    $state = $State
+    $logHandle = $LogHandle
+    $statePath = $StatePath
+    $stateWriter = $StateWriter
+    $readEventValue = {
+        param($InputObject, [string[]]$Names)
+        foreach ($name in $Names) {
+            if ($null -eq $InputObject) { return $null }
+            if ($InputObject -is [System.Collections.IDictionary]) {
+                if ($InputObject.Contains($name)) { return $InputObject[$name] }
+            }
+            else {
+                $property = $InputObject.PSObject.Properties[$name]
+                if ($null -ne $property) { return $property.Value }
+            }
+        }
+        return $null
+    }.GetNewClosure()
+    $writer = {
+        param($event)
+        try {
+            $eventState = [string](& $readEventValue $event @('State'))
+            if ([string]::IsNullOrWhiteSpace($eventState)) { $eventState = [string]$state.State }
+            $eventStage = [string](& $readEventValue $event @('Stage'))
+            $eventAttemptId = [string](& $readEventValue $event @('AttemptId'))
+        }
+        catch {
+            return [pscustomobject]@{ Success = $false; ReasonCode = 'EventWriteFailed'; Message = $_.Exception.Message }
+        }
+        $entry = [pscustomobject]@{
+            JobId = $state.JobId
+            State = $eventState
+            Stage = $eventStage
+            AttemptId = $eventAttemptId
+            EventType = [string](& $readEventValue $event @('EventType'))
+            Result = [string](& $readEventValue $event @('Result'))
+            SourceIdentity = $state.SourceIdentity
+            DestinationIdentity = $state.DestinationIdentity
+            Decision = & $readEventValue $event @('Decision')
+            Error = & $readEventValue $event @('Error')
+            Gate = & $readEventValue $event @('Gate')
+        }
+
+        $priorSequence = [int]$state.LastEventSequence
+        $write = $null
+        try {
+            $write = RecoveryLogging\Write-RecoveryLogEntry -Writer $logHandle -Entry $entry
+        }
+        catch {
+            return [pscustomobject]@{ Success = $false; ReasonCode = 'EventWriteFailed'; Message = $_.Exception.Message }
+        }
+        if ($null -eq $write -or $write.Success -ne $true) {
+            return [pscustomobject]@{ Success = $false; ReasonCode = 'EventWriteFailed'; Message = 'The event log write was refused.' }
+        }
+        $reportedSequence = & $readEventValue $write @('Sequence')
+        if ($null -eq $reportedSequence) {
+            return [pscustomobject]@{ Success = $false; ReasonCode = 'EventSequenceMissing'; Message = 'The event writer did not report its durable sequence.' }
+        }
+        $sequence = 0
+        if (-not [int]::TryParse([string]$reportedSequence, [ref]$sequence) -or $sequence -le $priorSequence) {
+            return [pscustomobject]@{ Success = $false; ReasonCode = 'EventSequenceInvalid'; Message = 'The event writer returned an invalid durable sequence.' }
+        }
+        [void]($state.LastEventSequence = $sequence)
+        try { $snapshot = JobState\Write-RecoveryJobState -Path $statePath -State $state -Writer $stateWriter }
+        catch {
+            throw
+        }
+        if ($null -eq $snapshot -or $snapshot.Success -ne $true) {
+            return [pscustomobject]@{ Success = $false; ReasonCode = 'EventStateWriteFailed'; Message = 'The state snapshot after the event write failed.' }
+        }
+        return $write
+    }.GetNewClosure()
+    return $writer
+}
+
+function Get-RecoveryAutomationResumeRoute {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string]$From = '',
+        [AllowEmptyString()][string]$To = ''
+    )
+
+    # The resume entry may only continue the hops the documented state machine
+    # allows without a vendor action by this process: recording that an existing
+    # case is ready, the launch gate the technician attests to, and the
+    # verified-stage continuation the resume rules name. Every other decision is
+    # refused by name instead of being inferred or invented here.
+    $routes = @{}
+    $routes['PREFLIGHT_PASSED|CASE_READY'] = [pscustomobject]@{
+        Stage             = $null
+        AttemptIdSuffix   = $null
+        LaunchGateRequired = $false
+        ManualAction      = 'The durable case folder, claim marker, lock, and log are present. Record that the case is ready and continue before any vendor action.'
+    }
+    $routes['CASE_READY|SHORT_SCAN_RUNNING'] = [pscustomobject]@{
+        Stage             = 'SHORT_SCAN'
+        AttemptIdSuffix   = 'short-scan'
+        LaunchGateRequired = $true
+        ManualAction      = 'Start the documented File Scavenger session yourself and perform Look in, Look for, Quick scan, and Step 2: Save. This process never relaunches a vendor program on resume.'
+    }
+    $routes['SHORT_RECOVERY_VERIFIED|LONG_SCAN_RUNNING'] = [pscustomobject]@{
+        Stage             = 'LONG_SCAN'
+        AttemptIdSuffix   = 'long-scan'
+        LaunchGateRequired = $false
+        ManualAction      = 'Perform the documented Long scan and Step 2: Save in the File Scavenger session you already have open. The verified short recovery stage is never rerun.'
+    }
+    $key = $From + '|' + $To
+    if (-not $routes.ContainsKey($key)) { return $null }
+    return $routes[$key]
+}
+
+function New-RecoveryAutomationResumeResult {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ReasonCode,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Message,
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        [Parameter(Mandatory = $true)][object]$Context,
+        [AllowNull()][object]$Gate = $null
+    )
+
+    # Every resume outcome is a stop. A resume never claims that a vendor stage
+    # completed, and it never reports success for a gate the technician has not
+    # passed. The context carries whatever was proven before the stop.
+    return New-RecoveryAutomationResult -Success $false -ExitCode $ExitCode -Mode 'Resume' `
+        -ReasonCode $ReasonCode -Message $Message -ConfigurationResult $Context.ConfigurationResult `
+        -VendorLaunchAttempted $false -RecoveryMediaTouched ([bool]$Context.MediaTouched) -Runtime $Context.Runtime `
+        -SourceIdentity $Context.SourceIdentity -DestinationIdentity $Context.DestinationIdentity `
+        -Capacity $Context.Capacity -Case $Context.Case -Gate $Gate -State $Context.State
+}
+
+function Invoke-RecoveryAutomationResume {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ResumePath,
+        [Parameter(Mandatory = $true)][AllowNull()][object]$DiskProvider,
+        [AllowNull()][object]$ConfigurationResult = $null,
+        [AllowNull()][object]$Runtime = $null,
+        [AllowNull()][object]$LockProvider = $null,
+        [AllowNull()][object]$LogWriterProvider = $null,
+        [AllowNull()][object]$StateWriter = $null,
+        [scriptblock]$InteractionProvider = $null,
+        [int64]$ReserveBytes = 0,
+        [AllowNull()][object]$Clock = $null
+    )
+
+    # The resume entry point. It never creates, moves, repairs, or overwrites a
+    # case, never relaunches a vendor process, and never reruns a stage: it
+    # acquires the existing case lock, reads the durable state through the
+    # validated binding gate, re-resolves the source and destination with the same
+    # provider the run uses, and acts only on the validated decision. Refusals
+    # write no case byte.
+    $context = [pscustomobject]@{
+        ConfigurationResult = $ConfigurationResult
+        Runtime             = $Runtime
+        Case                = $null
+        State               = $null
+        MediaTouched        = $false
+        SourceIdentity      = $null
+        DestinationIdentity = $null
+        Capacity            = $null
+    }
+    $logHandle = $null
+    $pendingLockGate = $null
+    try {
+        if ([string]::IsNullOrWhiteSpace($ResumePath)) {
+            return New-RecoveryAutomationResumeResult -ReasonCode 'ResumePathMissing' -ExitCode 5 `
+                -Message 'A resume requires the literal case folder path.' -Context $context
+        }
+        $casePath = $ResumePath.Trim()
+        while ($casePath.Length -gt 1 -and ($casePath.EndsWith('\') -or $casePath.EndsWith('/'))) {
+            $casePath = $casePath.Substring(0, $casePath.Length - 1)
+        }
+        if (-not [System.IO.Directory]::Exists($casePath)) {
+            return New-RecoveryAutomationResumeResult -ReasonCode 'ResumeCaseFolderMissing' -ExitCode 5 `
+                -Message 'The case folder to resume does not exist.' -Context $context
+        }
+        $jobId = [System.IO.Path]::GetFileName($casePath)
+        if ([string]::IsNullOrWhiteSpace($jobId)) {
+            return New-RecoveryAutomationResumeResult -ReasonCode 'ResumePathInvalid' -ExitCode 5 `
+                -Message 'The resume path does not name a case folder.' -Context $context
+        }
+        $claimPath = Join-Path -Path $casePath -ChildPath 'job-claim.json'
+        $statePath = Join-Path -Path $casePath -ChildPath 'job-state.json'
+        $metadataPath = Join-Path -Path $casePath -ChildPath 'case-metadata.json'
+        $case = [pscustomobject]@{
+            JobFolderPath = $casePath
+            ClaimPath     = $claimPath
+            StatePath     = $statePath
+            LogPath       = $null
+            MetadataPath  = $metadataPath
+            FolderResult  = $null
+        }
+        $context.Case = $case
+        if (-not [System.IO.File]::Exists($claimPath)) {
+            return New-RecoveryAutomationResumeResult -ReasonCode 'ResumeClaimMarkerMissing' -ExitCode 5 `
+                -Message 'The case folder carries no claim marker, so it is not a claimed case.' -Context $context
+        }
+        if (-not [System.IO.File]::Exists($statePath)) {
+            return New-RecoveryAutomationResumeResult -ReasonCode 'ResumeStateMissing' -ExitCode 5 `
+                -Message 'The case folder carries no durable state snapshot.' -Context $context
+        }
+        $owner = 'RecoveryAutomation/' + $jobId
+
+        # The case lock is always acquired through the lock provider, never read
+        # from lease fields here: acquisition is what reports a stale or held
+        # lock, and this workflow never deletes a lock file.
+        $lock = JobState\Lock-RecoveryJob -JobPath $casePath -LockProvider $LockProvider -Clock $Clock -JobId $jobId -Owner $owner
+        if (-not $lock.Acquired) {
+            if ($lock.IsStale -eq $true) {
+                # A stale lock is a gate, not an invitation. The technician removes
+                # the lock file; the retry then goes through the same acquisition.
+                $pendingLockGate = Invoke-RecoveryAutomationGate -GateId 'G-06' `
+                    -Reason 'The job lock lease has expired. This workflow never deletes a lock: remove the lock file yourself, then choose to retry the resume.' `
+                    -Evidence $lock -Choices @('Retry resume after removing the lock', 'Stop') -SafeDefault 'Stop' `
+                    -InteractionProvider $InteractionProvider
+                if ($pendingLockGate.Continues) {
+                    $lock = JobState\Lock-RecoveryJob -JobPath $casePath -LockProvider $LockProvider -Clock $Clock -JobId $jobId -Owner $owner
+                }
+                if (-not $lock.Acquired) {
+                    $lockReason = 'LockNotAcquired'
+                    if (-not [string]::IsNullOrWhiteSpace([string]$lock.ReasonCode)) { $lockReason = [string]$lock.ReasonCode }
+                    return New-RecoveryAutomationResumeResult -ReasonCode $lockReason -ExitCode 6 `
+                        -Message ('The case lock could not be acquired. ' + [string]$lock.Message) `
+                        -Context $context -Gate $pendingLockGate
+                }
+            }
+            else {
+                $lockReason = 'LockNotAcquired'
+                if (-not [string]::IsNullOrWhiteSpace([string]$lock.ReasonCode)) { $lockReason = [string]$lock.ReasonCode }
+                return New-RecoveryAutomationResumeResult -ReasonCode $lockReason -ExitCode 6 `
+                    -Message ('The case lock is not available. ' + [string]$lock.Message) -Context $context
+            }
+        }
+
+        # The durable state, read through the validated binding gate: schema, job
+        # id, log sequence, identities, claim, owner, and a live lease.
+        $read = JobState\Read-RecoveryJobState -Path $statePath -Lock $lock -Clock $Clock -ExpectedOwner $owner
+        if (-not $read.Success) {
+            return New-RecoveryAutomationResumeResult -ReasonCode ([string]$read.ReasonCode) -ExitCode 6 `
+                -Message ('The case state is not resumable: ' + [string]$read.Message) -Context $context
+        }
+        $state = $read.State
+        $context.State = $state
+        $logPath = [string](Get-RecoveryAutomationValue -InputObject $state.Paths -Names @('LogPath'))
+        $case.LogPath = $logPath
+        if ([string]::IsNullOrWhiteSpace($logPath)) {
+            return New-RecoveryAutomationResumeResult -ReasonCode 'ResumeLogPathMissing' -ExitCode 6 `
+                -Message 'The state does not record its event log path.' -Context $context
+        }
+
+        # Fresh identity, separation, and capacity: the recorded snapshots are
+        # never trusted on their own for a resume.
+        $sourcePath = [string](Get-RecoveryAutomationValue -InputObject $state.SourceIdentity -Names @('CanonicalPath', 'Path'))
+        if ([string]::IsNullOrWhiteSpace($sourcePath)) {
+            return New-RecoveryAutomationResumeResult -ReasonCode 'ResumeSourcePathMissing' -ExitCode 6 `
+                -Message 'The state does not record the source path of the case.' -Context $context
+        }
+        $sourceIdentity = DiskDetection\Resolve-RecoveryPathIdentity -Path $sourcePath -Provider $DiskProvider
+        $context.SourceIdentity = $sourceIdentity
+        $context.MediaTouched = $true
+        $destinationIdentity = DiskDetection\Resolve-RecoveryPathIdentity -Path $casePath -Provider $DiskProvider
+        $context.DestinationIdentity = $destinationIdentity
+        $separation = DiskDetection\Test-DestinationSafety -SourceIdentity $sourceIdentity `
+            -DestinationPath $casePath -Provider $DiskProvider -DestinationIdentity $destinationIdentity
+        if (-not $separation.Allowed) {
+            $separationReason = 'DestinationIndeterminate'
+            if (-not [string]::IsNullOrWhiteSpace([string]$separation.ReasonCode)) { $separationReason = [string]$separation.ReasonCode }
+            return New-RecoveryAutomationResumeResult -ReasonCode $separationReason -ExitCode 5 `
+                -Message 'The case folder is not proven separate from the recorded source.' -Context $context
+        }
+        $capacity = DiskDetection\Get-RecoveryDestinationSpace -Path $casePath -Provider $DiskProvider -ReserveBytes $ReserveBytes
+        $context.Capacity = $capacity
+
+        # The validated decision. It is called without a log path and without an
+        # event writer on purpose: the binding was already proven by the state
+        # read, and the entry point owns the durable transition and its
+        # verification rather than letting a decision helper record it.
+        $decision = JobState\Get-RecoveryResumeDecision -State $state -FreshSourceIdentity $sourceIdentity `
+            -FreshDestinationIdentity $destinationIdentity -FreshSpace $capacity
+        $decisionName = [string]$decision.Decision
+        $decisionReason = [string]$decision.ReasonCode
+
+        $openAttempt = ($decisionName -eq 'NeedsReview' -and $decisionReason -eq 'OpenAttempt')
+        if ($decisionName -ne 'ResumeNext' -and -not $openAttempt) {
+            if ([string]::IsNullOrWhiteSpace($decisionReason)) { $decisionReason = 'ResumeDecisionRefused' }
+            if ($decisionName -ne 'FailedClosed' -and $decisionName -ne 'NeedsReview') { $decisionReason = 'ResumeDecisionUnrecognised' }
+            $exitCode = 6
+            if ($decisionReason -eq 'SourceIdentityChanged') { $exitCode = 4 }
+            elseif ($decisionReason -eq 'DestinationIdentityChanged') { $exitCode = 5 }
+            return New-RecoveryAutomationResumeResult -ReasonCode $decisionReason -ExitCode $exitCode `
+                -Message ('The validated resume decision refused this case: ' + [string]$decision.Message) -Context $context
+        }
+
+        $route = $null
+        if (-not $openAttempt) {
+            $route = Get-RecoveryAutomationResumeRoute -From ([string]$state.State) -To ([string]$decision.NextState)
+            if ($null -eq $route) {
+                return New-RecoveryAutomationResumeResult -ReasonCode 'ResumeRouteUnsupported' -ExitCode 6 `
+                    -Message ('The decision routes {0} to {1}, which this entry point must not continue without the vendor action a resume never takes.' -f [string]$state.State, [string]$decision.NextState) `
+                    -Context $context
+            }
+        }
+
+        # The case log is reopened for resume only after the state read proved the
+        # existing log binds at the recorded sequence; New-RecoveryLog -Resume
+        # validates it again before it continues the sequence.
+        $logResult = RecoveryLogging\New-RecoveryLog -Path $logPath -JobId $jobId -Writer $LogWriterProvider -Clock $Clock -Resume
+        if (-not $logResult.Success) {
+            return New-RecoveryAutomationResumeResult -ReasonCode ([string]$logResult.ReasonCode) -ExitCode 6 `
+                -Message ('The case log cannot be resumed: ' + [string]$logResult.Message) -Context $context
+        }
+        $logHandle = $logResult.Writer
+        $eventWriter = New-RecoveryAutomationCaseEventWriter -State $state -LogHandle $logHandle -StatePath $statePath -StateWriter $StateWriter
+        if ($null -ne $pendingLockGate) {
+            # The lock gate was presented before the state could be read (the lock
+            # is what authorizes the read), so it is recorded here, once the case
+            # log is open and the state is proven.
+            $lockGateSave = Save-RecoveryAutomationGate -State $state -Case $case -LogWriter $logHandle `
+                -GateResult $pendingLockGate -StateWriter $StateWriter -Stage ([string]$state.Stage) -AttemptId ([string]$state.AttemptId)
+            if (-not $lockGateSave.Success) {
+                return New-RecoveryAutomationResumeResult -ReasonCode ([string]$lockGateSave.ReasonCode) -ExitCode 6 `
+                    -Message ([string]$lockGateSave.Message) -Context $context -Gate $pendingLockGate
+            }
+        }
+
+        if ($openAttempt) {
+            # An open attempt becomes durably INTERRUPTED_UNKNOWN with its own
+            # recorded event before any prompt about the attempt: the decision
+            # helper only reports the state, and this entry point owns both the
+            # transition and the verification that it landed.
+            $interruptContext = @{ EventType = 'StageInterruptedUnknown'; Result = 'NeedsReview'; Reason = 'OpenAttempt' }
+            $transition = JobState\Set-RecoveryState -State $state -To 'INTERRUPTED_UNKNOWN' -EventWriter $eventWriter `
+                -StateWriter $StateWriter -Context $interruptContext -Clock $Clock
+            if (-not $transition.Success) {
+                return New-RecoveryAutomationResumeResult -ReasonCode ([string]$transition.ReasonCode) -ExitCode 6 `
+                    -Message ('The interrupted attempt could not be durably recorded, so the resume stopped without prompting: ' + [string]$transition.Message) `
+                    -Context $context
+            }
+            $verified = JobState\Read-RecoveryJobState -Path $statePath -Lock $lock -Clock $Clock -ExpectedOwner $owner
+            if (-not $verified.Success -or [string]$verified.State.State -ne 'INTERRUPTED_UNKNOWN') {
+                return New-RecoveryAutomationResumeResult -ReasonCode 'ResumeInterruptionNotDurable' -ExitCode 6 `
+                    -Message 'The interrupted attempt was not durably recorded as INTERRUPTED_UNKNOWN, so the resume stopped without prompting.' `
+                    -Context $context
+            }
+            $state = $verified.State
+            $context.State = $state
+            $interruptGate = Invoke-RecoveryAutomationGate -GateId 'G-06' `
+                -Reason 'The previous attempt has no verified completion and is now durably recorded as INTERRUPTED_UNKNOWN. Inspect the case and decide out of band; this workflow never reruns the attempt automatically.' `
+                -Evidence ([pscustomobject]@{ State = 'INTERRUPTED_UNKNOWN'; Stage = [string]$state.Stage; AttemptId = [string]$state.AttemptId; ReasonCode = 'OpenAttempt' }) `
+                -Choices @('Inspect the case and stop', 'Stop') -SafeDefault 'Stop' -InteractionProvider $InteractionProvider
+            $interruptGateSave = Save-RecoveryAutomationGate -State $state -Case $case -LogWriter $logHandle `
+                -GateResult $interruptGate -StateWriter $StateWriter -Stage ([string]$state.Stage) -AttemptId ([string]$state.AttemptId)
+            if (-not $interruptGateSave.Success) {
+                return New-RecoveryAutomationResumeResult -ReasonCode ([string]$interruptGateSave.ReasonCode) -ExitCode 6 `
+                    -Message ([string]$interruptGateSave.Message) -Context $context -Gate $interruptGate
+            }
+            return New-RecoveryAutomationResumeResult -ReasonCode 'ManualGatePending' -ExitCode 8 `
+                -Message 'The open attempt is durably INTERRUPTED_UNKNOWN with its own recorded event. No stage was rerun, no vendor process was launched, and the resume did not claim success.' `
+                -Context $context -Gate $interruptGate
+        }
+
+        # The evidence this transition requires is taken from the validated
+        # transition table instead of being invented here, and a transition that
+        # itself demands an operator decision is refused: a resume never supplies
+        # one on the technician's behalf.
+        $probe = JobState\Test-RecoveryStateTransition -From ([string]$state.State) -To ([string]$decision.NextState) -Context @{}
+        if (-not $probe.Allowed -and [string]$probe.ReasonCode -ne 'MissingEvidence') {
+            return New-RecoveryAutomationResumeResult -ReasonCode 'ResumeTransitionRefused' -ExitCode 6 `
+                -Message ('The routed transition is not available to a resume: ' + [string]$probe.Message) -Context $context
+        }
+        $launchGate = $null
+        if ($route.LaunchGateRequired) {
+            # The documented manual gate, presented before the transition it
+            # authorizes: nothing is relaunched, and the technician's recorded
+            # decision is what lets the launch gate evidence be stated.
+            $launchGate = Invoke-RecoveryAutomationGate -GateId 'G-04' `
+                -Reason ('Resuming this case requires the documented manual File Scavenger action. ' + [string]$route.ManualAction) `
+                -Evidence ([pscustomobject]@{ State = [string]$state.State; NextState = [string]$decision.NextState; Stage = [string]$route.Stage }) `
+                -Choices @('Continue', 'Stop') -SafeDefault 'Stop' -InteractionProvider $InteractionProvider
+            $launchGateSave = Save-RecoveryAutomationGate -State $state -Case $case -LogWriter $logHandle `
+                -GateResult $launchGate -StateWriter $StateWriter -Stage ([string]$state.Stage) -AttemptId ([string]$state.AttemptId)
+            if (-not $launchGateSave.Success) {
+                return New-RecoveryAutomationResumeResult -ReasonCode ([string]$launchGateSave.ReasonCode) -ExitCode 6 `
+                    -Message ([string]$launchGateSave.Message) -Context $context -Gate $launchGate
+            }
+            if (-not $launchGate.Continues) {
+                return New-RecoveryAutomationResumeResult -ReasonCode 'ManualGatePending' -ExitCode 8 `
+                    -Message 'The resume stopped at the documented manual gate. Nothing was rerun and no state advanced.' `
+                    -Context $context -Gate $launchGate
+            }
+        }
+        $transitionContext = @{ Evidence = $probe.RequiredEvidence; EventType = 'StageStarted' }
+        if (-not [string]::IsNullOrWhiteSpace([string]$route.Stage)) { $transitionContext['Stage'] = [string]$route.Stage }
+        if (-not [string]::IsNullOrWhiteSpace([string]$route.AttemptIdSuffix)) {
+            $transitionContext['AttemptId'] = ($jobId + '-' + [string]$route.AttemptIdSuffix + '-001')
+        }
+        $routeTransition = JobState\Set-RecoveryState -State $state -To ([string]$decision.NextState) -EventWriter $eventWriter `
+            -StateWriter $StateWriter -Context $transitionContext -Clock $Clock
+        if (-not $routeTransition.Success) {
+            return New-RecoveryAutomationResumeResult -ReasonCode ([string]$routeTransition.ReasonCode) -ExitCode 6 `
+                -Message ('The routed state could not be durably recorded: ' + [string]$routeTransition.Message) -Context $context
+        }
+        $routeVerified = JobState\Read-RecoveryJobState -Path $statePath -Lock $lock -Clock $Clock -ExpectedOwner $owner
+        if (-not $routeVerified.Success -or [string]$routeVerified.State.State -ne [string]$decision.NextState) {
+            return New-RecoveryAutomationResumeResult -ReasonCode 'ResumeTransitionNotDurable' -ExitCode 6 `
+                -Message 'The routed state was not durably recorded, so the resume stopped.' -Context $context
+        }
+        $state = $routeVerified.State
+        $context.State = $state
+        if (-not $route.LaunchGateRequired) {
+            $manualGate = Invoke-RecoveryAutomationGate -GateId 'G-04' `
+                -Reason ('The case is routed to ' + [string]$decision.NextState + ' and the documented stage is manual. ' + [string]$route.ManualAction) `
+                -Evidence ([pscustomobject]@{ State = [string]$state.State; Stage = [string]$state.Stage; AttemptId = [string]$state.AttemptId }) `
+                -Choices @('Continue', 'Stop') -SafeDefault 'Stop' -InteractionProvider $InteractionProvider
+            $manualGateSave = Save-RecoveryAutomationGate -State $state -Case $case -LogWriter $logHandle `
+                -GateResult $manualGate -StateWriter $StateWriter -Stage ([string]$state.Stage) -AttemptId ([string]$state.AttemptId)
+            if (-not $manualGateSave.Success) {
+                return New-RecoveryAutomationResumeResult -ReasonCode ([string]$manualGateSave.ReasonCode) -ExitCode 6 `
+                    -Message ([string]$manualGateSave.Message) -Context $context -Gate $manualGate
+            }
+            return New-RecoveryAutomationResumeResult -ReasonCode 'ManualGatePending' -ExitCode 8 `
+                -Message ('The case was routed to ' + [string]$decision.NextState + ' and stopped at the documented manual gate. No vendor process was launched and no verified stage was rerun.') `
+                -Context $context -Gate $manualGate
+        }
+        return New-RecoveryAutomationResumeResult -ReasonCode 'ManualGatePending' -ExitCode 8 `
+            -Message ('The case was routed to ' + [string]$decision.NextState + ' and stopped at the documented manual gate. No vendor process was launched and no verified stage was rerun.') `
+            -Context $context -Gate $launchGate
+    }
+    finally {
+        # The case log is not held open between events, and every return path above
+        # releases the handle it opened.
+        if ($null -ne $logHandle) {
+            try {
+                $closeResult = RecoveryLogging\Close-RecoveryLog -Writer $logHandle
+                if ($null -eq $closeResult -or $closeResult.Success -ne $true) {
+                    Write-Warning 'The case event log handle could not be closed cleanly.'
+                }
+            }
+            catch {
+                Write-Warning ('The case event log handle could not be closed cleanly: ' + $_.Exception.Message)
+            }
+        }
+    }
+}
+
 function Invoke-RecoveryAutomation {
     [CmdletBinding()]
     param(
@@ -2454,6 +2923,7 @@ function Invoke-RecoveryAutomation {
         [string]$SourcePath = '',
         [string]$DestinationPath = '',
         [string]$ClientName = '',
+        [string]$ResumeJobPath = '',
         [object]$ConfigurationOverrides = $null,
         [object]$DiskProvider = $null,
         [scriptblock]$SourceSelector = $null,
@@ -2555,6 +3025,7 @@ function Invoke-RecoveryAutomation {
                 ClientName      = Get-RecoveryAutomationEffectiveClientName -ConfigurationResult $configurationResult `
                     -ParameterValue $ClientName
                 ConfigPath      = $resolvedConfigPath
+                ResumeJobPath   = if ($PSBoundParameters.ContainsKey('ResumeJobPath')) { [string]$ResumeJobPath } else { '' }
             }
             $dryRunMessage = 'Configuration and runtime diagnostics completed; no vendor or recovery-media operation was attempted.'
             $dryRunResult = New-RecoveryAutomationResult -Success $true -ExitCode 0 -Mode 'DryRun' `
@@ -2579,6 +3050,18 @@ function Invoke-RecoveryAutomation {
                 -ReasonCode $elevation.ReasonCode -Message ([string]$elevation.Evidence) `
                 -ConfigurationResult $configurationResult -VendorLaunchAttempted $false -RecoveryMediaTouched $false `
                 -Runtime $runtime -Applications ([pscustomobject]@{ Elevation = $elevation }) -Gate $gateResult
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace([string]$ResumeJobPath)) {
+            # Resume is an explicit entry, never a fallback: it happens after the
+            # elevation and runtime preflight and before any source selection, so a
+            # resume can never create, select, or claim a case of its own.
+            $resumeDiskProvider = $DiskProvider
+            if ($null -eq $resumeDiskProvider) { $resumeDiskProvider = New-RecoveryAutomationWindowsDiskProvider }
+            return Invoke-RecoveryAutomationResume -ResumePath $ResumeJobPath -DiskProvider $resumeDiskProvider `
+                -ConfigurationResult $configurationResult -Runtime $runtime -LockProvider $LockProvider `
+                -LogWriterProvider $LogWriterProvider -StateWriter $stateWriter -InteractionProvider $InteractionProvider `
+                -ReserveBytes ([int64]$configurationResult.Configuration.CapacityReserveBytes) -Clock $Clock
         }
 
         $fsResolution = ApplicationDiscovery\Resolve-RecoveryApplication -Product 'FileScavenger' `
@@ -2848,74 +3331,7 @@ function Invoke-RecoveryAutomation {
                 -DestinationIdentity $destinationIdentity -Capacity $capacity -Case $case -State $state
         }
         $logHandle = $logResult.Writer
-        $readEventValue = {
-            param($InputObject, [string[]]$Names)
-            foreach ($name in $Names) {
-                if ($null -eq $InputObject) { return $null }
-                if ($InputObject -is [System.Collections.IDictionary]) {
-                    if ($InputObject.Contains($name)) { return $InputObject[$name] }
-                }
-                else {
-                    $property = $InputObject.PSObject.Properties[$name]
-                    if ($null -ne $property) { return $property.Value }
-                }
-            }
-            return $null
-        }.GetNewClosure()
-        $eventWriter = {
-            param($event)
-            try {
-                $eventState = [string](& $readEventValue $event @('State'))
-                if ([string]::IsNullOrWhiteSpace($eventState)) { $eventState = [string]$state.State }
-                $eventStage = [string](& $readEventValue $event @('Stage'))
-                $eventAttemptId = [string](& $readEventValue $event @('AttemptId'))
-            }
-            catch {
-                return [pscustomobject]@{ Success = $false; ReasonCode = 'EventWriteFailed'; Message = $_.Exception.Message }
-            }
-            $entry = [pscustomobject]@{
-                JobId = $state.JobId
-                State = $eventState
-                Stage = $eventStage
-                AttemptId = $eventAttemptId
-                EventType = [string](& $readEventValue $event @('EventType'))
-                Result = [string](& $readEventValue $event @('Result'))
-                SourceIdentity = $state.SourceIdentity
-                DestinationIdentity = $state.DestinationIdentity
-                Decision = & $readEventValue $event @('Decision')
-                Error = & $readEventValue $event @('Error')
-                Gate = & $readEventValue $event @('Gate')
-            }
-
-            $priorSequence = [int]$state.LastEventSequence
-            $write = $null
-            try {
-                $write = RecoveryLogging\Write-RecoveryLogEntry -Writer $logHandle -Entry $entry
-            }
-            catch {
-                return [pscustomobject]@{ Success = $false; ReasonCode = 'EventWriteFailed'; Message = $_.Exception.Message }
-            }
-            if ($null -eq $write -or $write.Success -ne $true) {
-                return [pscustomobject]@{ Success = $false; ReasonCode = 'EventWriteFailed'; Message = 'The event log write was refused.' }
-            }
-            $reportedSequence = & $readEventValue $write @('Sequence')
-            if ($null -eq $reportedSequence) {
-                return [pscustomobject]@{ Success = $false; ReasonCode = 'EventSequenceMissing'; Message = 'The event writer did not report its durable sequence.' }
-            }
-            $sequence = 0
-            if (-not [int]::TryParse([string]$reportedSequence, [ref]$sequence) -or $sequence -le $priorSequence) {
-                return [pscustomobject]@{ Success = $false; ReasonCode = 'EventSequenceInvalid'; Message = 'The event writer returned an invalid durable sequence.' }
-            }
-            [void]($state.LastEventSequence = $sequence)
-            try { $snapshot = JobState\Write-RecoveryJobState -Path $case.StatePath -State $state -Writer $stateWriter }
-            catch {
-                throw
-            }
-            if ($null -eq $snapshot -or $snapshot.Success -ne $true) {
-                return [pscustomobject]@{ Success = $false; ReasonCode = 'EventStateWriteFailed'; Message = 'The state snapshot after the event write failed.' }
-            }
-            return $write
-        }.GetNewClosure()
+        $eventWriter = New-RecoveryAutomationCaseEventWriter -State $state -LogHandle $logHandle -StatePath $case.StatePath -StateWriter $stateWriter
         foreach ($eventName in @('SourceIdentityCaptured', 'DestinationIdentityCaptured', 'DestinationSeparationVerified')) {
             $eventResult = Write-RecoveryAutomationEvent -Writer $logHandle -State $state -EventType $eventName
             if (-not $eventResult.Success) {
@@ -3105,7 +3521,8 @@ if ($MyInvocation.InvocationName -ne '.') {
     # not forwarded is lost for the whole run.
     $elevationLaunch = Invoke-RecoveryAutomationSelfElevation -ScriptPath $PSCommandPath `
         -ConfigPath $RecoveryConfigPath -NoPause:$NoPause -DryRun:$DryRun -SkipElevation:$DryRun `
-        -SourcePath $SourcePath -DestinationPath $DestinationPath -ClientName $ClientName
+        -SourcePath $SourcePath -DestinationPath $DestinationPath -ClientName $ClientName `
+        -ResumeJobPath $ResumeJobPath
     if ($elevationLaunch.ShouldExit) {
         if ($elevationLaunch.Success) {
             exit $elevationLaunch.ExitCode
