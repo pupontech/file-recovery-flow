@@ -1102,14 +1102,14 @@ function Start-RStudioHandoff {
         VendorProcessPossible = $runnerInvoked
         Product               = $script:RSProductName
         ExecutablePath        = $executablePath
-        Arguments         = $arguments
-        ArgumentString    = $argumentString
-        ProcessIdentity   = $normalizedIdentity
-        Activation        = $activation
-        MainPanelGate     = $mainPanelGate
-        Preconditions     = $preconditions
-        Evidence          = $evidence
-        CompletedAtUtc    = [datetime]::UtcNow
+        Arguments             = $arguments
+        ArgumentString        = $argumentString
+        ProcessIdentity       = $normalizedIdentity
+        Activation            = $activation
+        MainPanelGate         = $mainPanelGate
+        Preconditions         = $preconditions
+        Evidence              = $evidence
+        CompletedAtUtc        = [datetime]::UtcNow
     }
 }
 
