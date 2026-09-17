@@ -926,15 +926,15 @@ Describe 'Folder selection and sanitization (C-12, C-13)' {
     It 'restricts client names to a deterministic ASCII alphabet' {
         $raw = ('Cl' + [char]0x00E9 + 'nt' + [char]0x0416 + 'A' + [char]0x0007 + 'B')
 
-        $sanitized = Sanitize-RecoveryName -Name $raw
+        $sanitized = Convert-RecoveryName -Name $raw
 
         $sanitized | Should -Match '^[A-Za-z0-9._-]+$'
         $sanitized | Should -Be 'Cl_nt_A_B'
     }
 
     It 'replaces each disallowed character without silently merging distinct names' {
-        $slashes = Sanitize-RecoveryName -Name ('a' + $script:Sep + $script:Sep + 'b')
-        $underscore = Sanitize-RecoveryName -Name 'a__b'
+        $slashes = Convert-RecoveryName -Name ('a' + $script:Sep + $script:Sep + 'b')
+        $underscore = Convert-RecoveryName -Name 'a__b'
 
         $slashes | Should -Be 'a__b'
         $underscore | Should -Be 'a__b'
@@ -942,23 +942,23 @@ Describe 'Folder selection and sanitization (C-12, C-13)' {
     }
 
     It 'removes trailing spaces and periods' {
-        $sanitized = Sanitize-RecoveryName -Name 'Client Name. .'
+        $sanitized = Convert-RecoveryName -Name 'Client Name. .'
 
         $sanitized | Should -Be 'Client_Name'
     }
 
     It 'rejects empty, reserved, and non-string names' {
-        { Sanitize-RecoveryName -Name '' } | Should -Throw
-        { Sanitize-RecoveryName -Name '   ' } | Should -Throw
-        { Sanitize-RecoveryName -Name 'CON' } | Should -Throw
-        { Sanitize-RecoveryName -Name 'lpt1.txt' } | Should -Throw
-        { Sanitize-RecoveryName -Name $null } | Should -Throw
+        { Convert-RecoveryName -Name '' } | Should -Throw
+        { Convert-RecoveryName -Name '   ' } | Should -Throw
+        { Convert-RecoveryName -Name 'CON' } | Should -Throw
+        { Convert-RecoveryName -Name 'lpt1.txt' } | Should -Throw
+        { Convert-RecoveryName -Name $null } | Should -Throw
     }
 
     It 'caps the client component at 40 characters and reports the truncation' {
         $long = 'ClientName' + ('x' * 60)
 
-        $sanitized = Sanitize-RecoveryName -Name $long -WarningVariable captured
+        $sanitized = Convert-RecoveryName -Name $long -WarningVariable captured
 
         $sanitized.Length | Should -BeLessOrEqual 40
         $captured | Should -Not -BeNullOrEmpty
@@ -1346,7 +1346,7 @@ Describe 'Append-only event log (C-15, C-16, C-17, C-22)' {
         $provider.Flush = { param($request) $provider.State.Calls.Add('Flush') | Out-Null; return $true }
 
         $afterBlock = Write-RecoveryLogEntry -Writer $handle.Writer -Entry (New-EventEntry -JobId 'JOB-0022' -EventType 'ScanFinished')
-        $flushAfterBlock = Flush-RecoveryLog -Writer $handle.Writer
+        $flushAfterBlock = Sync-RecoveryLog -Writer $handle.Writer
 
         $afterBlock.Success | Should -BeFalse
         $afterBlock.ReasonCode | Should -Be 'LogWriteBlocked'
@@ -1404,15 +1404,15 @@ Describe 'Append-only event log (C-15, C-16, C-17, C-22)' {
         $checked.LastEvent.Sequence | Should -Be 1
     }
 
-    It 'reports a flush failure from Flush-RecoveryLog instead of continuing silently' {
+    It 'reports a flush failure from Sync-RecoveryLog instead of continuing silently' {
         $fixture = New-LogFixture -FolderName 'job-log-i' -JobId 'JOB-0010'
         $provider = New-LogWriterProvider
         $handle = New-RecoveryLog -Path $fixture.LogPath -JobId $fixture.JobId -Clock (New-FixedClock) -Writer $provider
 
-        $ok = Flush-RecoveryLog -Writer $handle.Writer
+        $ok = Sync-RecoveryLog -Writer $handle.Writer
         $provider.State.Calls.Clear()
         $provider.Flush = { param($request) $provider.State.Calls.Add('Flush') | Out-Null; return $false }
-        $failed = Flush-RecoveryLog -Writer $handle.Writer
+        $failed = Sync-RecoveryLog -Writer $handle.Writer
 
         $ok.Success | Should -BeTrue
         $failed.Success | Should -BeFalse
@@ -1547,7 +1547,7 @@ Describe 'Job state schema, round trip, and ownership (C-18, C-19)' {
 
     It 'round-trips the full nested state through explicit JSON depth' {
         $fixture = New-StateFixture -FolderName 'job-state-d'
-        $lock = Acquire-RecoveryJobLock -JobPath $fixture.Folder -Clock (New-FixedClock) -JobId $fixture.JobId
+        $lock = Lock-RecoveryJob -JobPath $fixture.Folder -Clock (New-FixedClock) -JobId $fixture.JobId
 
         $written = Write-RecoveryJobState -Path $fixture.Paths.StatePath -State $fixture.State
         $read = Read-RecoveryJobState -Path $fixture.Paths.StatePath -Lock $lock
@@ -1592,7 +1592,7 @@ Describe 'Job state schema, round trip, and ownership (C-18, C-19)' {
 
     It 'rejects malformed, schema-mismatched, and incomplete state' {
         $fixture = New-StateFixture -FolderName 'job-state-g'
-        $lock = Acquire-RecoveryJobLock -JobPath $fixture.Folder -Clock (New-FixedClock) -JobId $fixture.JobId
+        $lock = Lock-RecoveryJob -JobPath $fixture.Folder -Clock (New-FixedClock) -JobId $fixture.JobId
         $malformedPath = Join-Path -Path $fixture.Folder -ChildPath 'malformed-state.json'
         [System.IO.File]::WriteAllText($malformedPath, '{"SchemaVersion":1,', [System.Text.UTF8Encoding]::new($false))
         $schemaPath = Join-Path -Path $fixture.Folder -ChildPath 'schema-state.json'
@@ -1688,7 +1688,7 @@ Describe 'Job state schema, round trip, and ownership (C-18, C-19)' {
         $fixture = New-StateFixture -FolderName 'job-state-l'
         $log = New-RecoveryLog -Path $fixture.Paths.LogPath -JobId $fixture.JobId -Clock (New-FixedClock)
         $eventWriter = { param($event) return (Write-RecoveryLogEntry -Writer $log.Writer -Entry $event).Success }.GetNewClosure()
-        $lock = Acquire-RecoveryJobLock -JobPath $fixture.Folder -Clock (New-FixedClock) -JobId $fixture.JobId
+        $lock = Lock-RecoveryJob -JobPath $fixture.Folder -Clock (New-FixedClock) -JobId $fixture.JobId
         Write-RecoveryJobState -Path $fixture.Paths.StatePath -State $fixture.State | Out-Null
 
         $result = Set-RecoveryState -State $fixture.State -To 'PREFLIGHT_PENDING' -EventWriter $eventWriter -Clock (New-FixedClock)
@@ -1722,8 +1722,8 @@ Describe 'Job lock exclusivity and stale handling (C-20)' {
         $folder = New-LockFixture -FolderName 'job-lock-b'
         $clock = New-FixedClock -UtcInstant '2026-09-16T07:00:00Z'
 
-        $first = Acquire-RecoveryJobLock -JobPath $folder -Clock $clock -Owner 'technician-1' -LeaseMinutes 30
-        $second = Acquire-RecoveryJobLock -JobPath $folder -Clock $clock -Owner 'technician-2' -LeaseMinutes 30
+        $first = Lock-RecoveryJob -JobPath $folder -Clock $clock -Owner 'technician-1' -LeaseMinutes 30
+        $second = Lock-RecoveryJob -JobPath $folder -Clock $clock -Owner 'technician-2' -LeaseMinutes 30
 
         $first.Acquired | Should -BeTrue
         $first.ReasonCode | Should -BeNullOrEmpty
@@ -1735,11 +1735,11 @@ Describe 'Job lock exclusivity and stale handling (C-20)' {
     It 'reports a stale lock as a gate and never deletes it automatically' {
         $folder = New-LockFixture -FolderName 'job-lock-c'
         $oldClock = New-FixedClock -UtcInstant '2026-09-16T07:00:00Z'
-        Acquire-RecoveryJobLock -JobPath $folder -Clock $oldClock -Owner 'technician-1' -LeaseMinutes 1 | Out-Null
+        Lock-RecoveryJob -JobPath $folder -Clock $oldClock -Owner 'technician-1' -LeaseMinutes 1 | Out-Null
         $lockPath = Join-Path -Path $folder -ChildPath 'job.lock'
         $before = [System.IO.File]::ReadAllBytes($lockPath)
 
-        $late = Acquire-RecoveryJobLock -JobPath $folder -Clock (New-FixedClock -UtcInstant '2026-09-16T09:00:00Z') -Owner 'technician-2' -LeaseMinutes 30
+        $late = Lock-RecoveryJob -JobPath $folder -Clock (New-FixedClock -UtcInstant '2026-09-16T09:00:00Z') -Owner 'technician-2' -LeaseMinutes 30
 
         $late.Acquired | Should -BeFalse
         $late.IsStale | Should -BeTrue
@@ -1752,7 +1752,7 @@ Describe 'Job lock exclusivity and stale handling (C-20)' {
         $folder = Join-Path -Path $TestDrive -ChildPath 'job-lock-e'
         New-Item -ItemType Directory -Path $folder -Force | Out-Null
 
-        $result = Acquire-RecoveryJobLock -JobPath $folder -Clock (New-FixedClock)
+        $result = Lock-RecoveryJob -JobPath $folder -Clock (New-FixedClock)
 
         $result.Acquired | Should -BeFalse
         $result.ReasonCode | Should -Be 'ClaimMarkerMissing'
@@ -1763,7 +1763,7 @@ Describe 'Job lock exclusivity and stale handling (C-20)' {
         $folder = New-LockFixture -FolderName 'job-lock-d'
         $failing = @{ Name = 'FailingLockProvider'; CreateNew = { param($request) return [pscustomobject]@{ Success = $false; ReasonCode = 'ClaimFailed'; Message = 'fixture' } } }
 
-        $result = Acquire-RecoveryJobLock -JobPath $folder -Clock (New-FixedClock) -LockProvider $failing
+        $result = Lock-RecoveryJob -JobPath $folder -Clock (New-FixedClock) -LockProvider $failing
 
         $result.Acquired | Should -BeFalse
         $result.ReasonCode | Should -Be 'LockAcquireFailed'
@@ -1918,7 +1918,7 @@ Describe 'Resume binding and snapshot preservation (C-18, C-19, C-20)' {
             $state.Stage = 'CASE'
             $state.AttemptId = 'ATTEMPT-0'
             Write-RecoveryJobState -Path $paths.StatePath -State $state | Out-Null
-            $lock = Acquire-RecoveryJobLock -JobPath $folder -Clock (New-FixedClock) -Owner 'technician-1' -JobId $JobId
+            $lock = Lock-RecoveryJob -JobPath $folder -Clock (New-FixedClock) -Owner 'technician-1' -JobId $JobId
             return [pscustomobject]@{ Folder = $folder; Paths = $paths; State = $state; Lock = $lock; JobId = $JobId; ClaimId = $claimId; Log = $log }
         }
     }
@@ -2059,7 +2059,7 @@ Describe 'Durable case exists before any external action (C-21 core)' {
 
         $jobFolder = New-RecoveryJobFolder -RootPath $root -ClientName 'OrderClient' -Clock $clock
         $order.Add('FolderClaimed') | Out-Null
-        $lock = Acquire-RecoveryJobLock -JobPath $jobFolder.JobFolderPath -Clock $clock -Owner 'technician-1'
+        $lock = Lock-RecoveryJob -JobPath $jobFolder.JobFolderPath -Clock $clock -Owner 'technician-1'
         $order.Add('LockAcquired') | Out-Null
         $paths = New-CasePaths -JobFolder $jobFolder.JobFolderPath
         $log = New-RecoveryLog -Path $paths.LogPath -JobId 'JOB-4000' -Clock $clock
@@ -2154,12 +2154,25 @@ Describe 'Module source contracts' {
         $logExports = (Get-Module -Name RecoveryLogging).ExportedFunctions.Keys | Sort-Object
         $stateExports = (Get-Module -Name JobState).ExportedFunctions.Keys | Sort-Object
 
-        $expectedDisk = @('Get-PhysicalDiskIdentity', 'Get-RecoveryDestinationSpace', 'Get-RecoveryVolumeInventory', 'New-RecoveryJobFolder', 'Resolve-RecoveryDiskProvider', 'Resolve-RecoveryPathIdentity', 'Sanitize-RecoveryName', 'Select-DestinationFolder', 'Test-DestinationSafety' | Sort-Object)
-        $expectedLog = @('Flush-RecoveryLog', 'New-RecoveryLog', 'Test-RecoveryLog', 'Write-RecoveryLogEntry' | Sort-Object)
-        $expectedState = @('Acquire-RecoveryJobLock', 'Get-RecoveryResumeDecision', 'New-RecoveryJobState', 'Read-RecoveryJobState', 'Set-RecoveryState', 'Test-RecoveryStateTransition', 'Write-RecoveryJobState' | Sort-Object)
+        $expectedDisk = @('Get-PhysicalDiskIdentity', 'Get-RecoveryDestinationSpace', 'Get-RecoveryVolumeInventory', 'New-RecoveryJobFolder', 'Resolve-RecoveryDiskProvider', 'Resolve-RecoveryPathIdentity', 'Convert-RecoveryName', 'Select-DestinationFolder', 'Test-DestinationSafety' | Sort-Object)
+        $expectedLog = @('Sync-RecoveryLog', 'New-RecoveryLog', 'Test-RecoveryLog', 'Write-RecoveryLogEntry' | Sort-Object)
+        $expectedState = @('Lock-RecoveryJob', 'Get-RecoveryResumeDecision', 'New-RecoveryJobState', 'Read-RecoveryJobState', 'Set-RecoveryState', 'Test-RecoveryStateTransition', 'Write-RecoveryJobState' | Sort-Object)
 
         ($diskExports -join '|') | Should -Be ($expectedDisk -join '|')
         ($logExports -join '|') | Should -Be ($expectedLog -join '|')
         ($stateExports -join '|') | Should -Be ($expectedState -join '|')
+    }
+
+    It 'does not export commands with unapproved PowerShell verbs' {
+        $diskExports = (Get-Module -Name DiskDetection).ExportedFunctions.Keys
+        $logExports = (Get-Module -Name RecoveryLogging).ExportedFunctions.Keys
+        $stateExports = (Get-Module -Name JobState).ExportedFunctions.Keys
+
+        $diskExports | Should -Not -Contain 'Sanitize-RecoveryName'
+        $logExports | Should -Not -Contain 'Flush-RecoveryLog'
+        $stateExports | Should -Not -Contain 'Acquire-RecoveryJobLock'
+        $diskExports | Should -Contain 'Convert-RecoveryName'
+        $logExports | Should -Contain 'Sync-RecoveryLog'
+        $stateExports | Should -Contain 'Lock-RecoveryJob'
     }
 }

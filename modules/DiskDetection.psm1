@@ -888,7 +888,7 @@ function Test-RecoveryReservedDeviceName {
     return ($base -imatch '^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$')
 }
 
-function Sanitize-RecoveryName {
+function Convert-RecoveryName {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][AllowEmptyString()][object]$Name,
@@ -1004,7 +1004,7 @@ function New-RecoveryJobFolder {
         return $result
     }
     try {
-        $sanitized = Sanitize-RecoveryName -Name $ClientName -MaxLength 40
+        $sanitized = Convert-RecoveryName -Name $ClientName -MaxLength 40
     }
     catch {
         $result.ReasonCode = 'ClientNameInvalid'
@@ -1110,7 +1110,7 @@ Export-ModuleMember -Function @(
     'New-RecoveryJobFolder',
     'Resolve-RecoveryDiskProvider',
     'Resolve-RecoveryPathIdentity',
-    'Sanitize-RecoveryName',
+    'Convert-RecoveryName',
     'Select-DestinationFolder',
     'Test-DestinationSafety'
 )

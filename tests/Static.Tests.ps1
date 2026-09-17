@@ -681,10 +681,41 @@ Describe 'File Recovery Flow static contracts' {
             (Format-ContractViolation -Violation $unexpected) | Should -BeNullOrEmpty
         }
 
-        It 'S-09: the launcher never forces elevation' {
+        It 'S-09: the batch launcher delegates elevation to the entry point' {
             $text = Get-ContractText -RelativePath $script:LauncherRelativePath
-            $found = @(Find-ContractLiteral -Text $text -Literal $script:LauncherElevationTokens)
-            (Format-ContractViolation -Violation $found) | Should -BeNullOrEmpty
+            $text.Contains('-Command') | Should -BeFalse
+            $text.Contains('-Verb RunAs') | Should -BeFalse
+            $text.Contains('Start-Process') | Should -BeFalse
+        }
+
+        It 'S-09: the entry point self-elevates and waits for the elevated child' {
+            $text = Get-ContractText -RelativePath $script:EntryPointRelativePath
+            $text.Contains('Start-Process') | Should -BeTrue
+            $text.Contains('-Verb RunAs') | Should -BeTrue
+            $text.Contains('-WorkingDirectory $PSScriptRoot') | Should -BeTrue
+            $text.Contains('-Wait') | Should -BeTrue
+            $text.Contains('ElevationDeclined') | Should -BeTrue
+            $text.Contains(([string][char]92 + [string][char]34)) | Should -BeFalse
+        }
+
+        It 'S-09: the relaunch argument helper quotes spaced paths without backslash-quote corruption' {
+            $parse = Get-ContractParseResult -RelativePath $script:EntryPointRelativePath
+            $functions = @($parse.Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -eq 'Get-RecoveryAutomationElevationArgumentLine'
+                }, $true))
+            $functions.Count | Should -Be 1
+            $definition = $functions[0].Extent.Text + "`n" + @'
+Get-RecoveryAutomationElevationArgumentLine -ScriptPath 'C:\Recovery Jobs\RecoveryAutomation.ps1' -ConfigPath 'C:\Recovery Jobs\client config.json' -NoPause -DryRun
+'@
+            $argumentLine = & ([scriptblock]::Create($definition))
+
+            $argumentLine | Should -Match '"C:\\Recovery Jobs\\RecoveryAutomation\.ps1"'
+            $argumentLine | Should -Match '"C:\\Recovery Jobs\\client config\.json"'
+            $argumentLine | Should -Match '-NoPause'
+            $argumentLine | Should -Match '-DryRun'
+            $argumentLine.Contains(([string][char]92 + [string][char]34)) | Should -BeFalse
         }
 
         It 'S-09: the launcher pauses only behind the explicit opt-out' {

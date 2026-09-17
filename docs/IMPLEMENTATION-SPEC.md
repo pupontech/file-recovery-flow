@@ -245,7 +245,7 @@ Public contract:
 - `Select-DestinationFolder -PickerProvider <scriptblock> -TypedPathProvider
   <scriptblock>` uses the documented folder picker first and returns the selected
   path plus selection method, or a stop result.
-- `Sanitize-RecoveryName -Name <string>` returns a deterministic ASCII component.
+- `Convert-RecoveryName -Name <string>` returns a deterministic ASCII component.
   The result alphabet is `[A-Za-z0-9._-]`, reserved device names and trailing
   spaces/periods are rejected or removed, empty results are errors, and the
   client-name component is capped at 40 characters.
@@ -286,7 +286,7 @@ Public contract:
   event with a monotonic sequence, UTC timestamp, job ID, state, stage,
   attempt ID, event type, result, source/destination identity references, gate
   decision, and structured error details where applicable.
-- `Flush-RecoveryLog -Writer <object>` flushes the durable event and returns a
+- `Sync-RecoveryLog -Writer <object>` flushes the durable event and returns a
   failure rather than silently continuing.
 - `Test-RecoveryLog -Path <literal path>` detects malformed JSONL, missing or
   duplicate sequences, wrong job ID, and truncation.
@@ -320,7 +320,7 @@ Public contract:
   checks.
 - `Set-RecoveryState -State <object> -To <state> -EventWriter <provider>`
   writes the boundary event and snapshot only when the transition is legal.
-- `Acquire-RecoveryJobLock -JobPath <literal path> -LockProvider <provider>`
+- `Lock-RecoveryJob -JobPath <literal path> -LockProvider <provider>`
   obtains an exclusive lock before reading resume state. A stale lock is a gate,
   not an invitation to delete it.
 - `Get-RecoveryResumeDecision -State -FreshSourceIdentity -FreshDestinationIdentity

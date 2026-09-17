@@ -3,8 +3,8 @@ rem File Recovery Flow - thin double-click launcher for the recovery workflow.
 rem This file starts one script and nothing else: it copies, moves, deletes,
 rem formats, and repairs nothing. All workflow logic and every safety check live
 rem in RecoveryAutomation.ps1.
-rem The entry point is started with Windows PowerShell 5.1 explicitly. Elevation
-rem is verified by the entry point preflight and is never forced here.
+rem The entry point starts Windows PowerShell 5.1 and self-elevates through UAC
+rem when required; the elevated child is waited on and its exit code is returned.
 rem Usage: Start-Recovery.bat <entry point arguments> [-NoPause]
 rem Closing prompt: keep the console open so a double-click user can read the
 rem result. Set RECOVERY_NO_PAUSE, or pass -NoPause, to suppress it. Automated

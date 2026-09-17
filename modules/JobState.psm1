@@ -1027,7 +1027,7 @@ function Get-RecoveryDefaultLockProvider {
     return $provider
 }
 
-function Acquire-RecoveryJobLock {
+function Lock-RecoveryJob {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][AllowEmptyString()][object]$JobPath,
@@ -1315,7 +1315,7 @@ function Get-RecoveryResumeDecision {
 }
 
 Export-ModuleMember -Function @(
-    'Acquire-RecoveryJobLock',
+    'Lock-RecoveryJob',
     'Get-RecoveryResumeDecision',
     'New-RecoveryJobState',
     'Read-RecoveryJobState',

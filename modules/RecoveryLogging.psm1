@@ -558,7 +558,7 @@ function Write-RecoveryLogEntry {
     return $result
 }
 
-function Flush-RecoveryLog {
+function Sync-RecoveryLog {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][object]$Writer
@@ -590,7 +590,7 @@ function Flush-RecoveryLog {
 }
 
 Export-ModuleMember -Function @(
-    'Flush-RecoveryLog',
+    'Sync-RecoveryLog',
     'New-RecoveryLog',
     'Test-RecoveryLog',
     'Write-RecoveryLogEntry'

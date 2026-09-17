@@ -99,8 +99,9 @@ What the launcher does (it does nothing else):
 1. Resolves its own folder with `%~dp0`, so the current directory does not matter.
 2. Passes every argument you give it straight through to the entry point.
 3. Runs `powershell.exe -NoProfile -ExecutionPolicy Bypass -File <folder>\RecoveryAutomation.ps1`
-   with those arguments. Windows PowerShell 5.1 is requested explicitly, and the
-   launcher does not force elevation.
+   with those arguments. Windows PowerShell 5.1 is requested explicitly; the entry
+   point self-elevates through UAC when needed, waits for the elevated child, and
+   propagates its exit code.
 4. Keeps the console open at the end so you can read the result, unless you suppress
    the closing prompt with `-NoPause` or by setting `RECOVERY_NO_PAUSE=1`.
 5. Returns the entry point's exit code unchanged through `exit /b`.

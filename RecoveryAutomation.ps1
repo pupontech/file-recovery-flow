@@ -42,6 +42,99 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+function Test-RecoveryAutomationHostElevated {
+    [CmdletBinding()]
+    param()
+
+    if ($env:OS -ne 'Windows_NT') {
+        return $true
+    }
+    try {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
+        return [bool]$principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-RecoveryAutomationElevationArgumentLine {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ScriptPath,
+        [string]$ConfigPath = '',
+        [switch]$NoPause,
+        [switch]$DryRun
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ScriptPath)) {
+        throw 'The entry point path is required for an elevated relaunch.'
+    }
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $ScriptPath + '"'))
+    if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
+        $arguments += @('-ConfigPath', ('"' + $ConfigPath + '"'))
+    }
+    if ($NoPause) { $arguments += '-NoPause' }
+    if ($DryRun) { $arguments += '-DryRun' }
+    return ($arguments -join ' ')
+}
+
+function Invoke-RecoveryAutomationSelfElevation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ScriptPath,
+        [string]$ConfigPath = '',
+        [switch]$NoPause,
+        [switch]$DryRun
+    )
+
+    if ($env:OS -ne 'Windows_NT' -or (Test-RecoveryAutomationHostElevated)) {
+        return [pscustomobject]@{
+            ShouldExit = $false
+            Success = $true
+            ExitCode = 0
+            ReasonCode = $null
+            Message = $null
+        }
+    }
+
+    try {
+        $powershellPath = [System.IO.Path]::Combine($PSHOME, 'powershell.exe')
+        $argumentLine = Get-RecoveryAutomationElevationArgumentLine -ScriptPath $ScriptPath `
+            -ConfigPath $ConfigPath -NoPause:$NoPause -DryRun:$DryRun
+        $child = Start-Process -FilePath $powershellPath -ArgumentList $argumentLine `
+            -Verb RunAs -WorkingDirectory $PSScriptRoot -Wait -PassThru -ErrorAction Stop
+        if ($null -eq $child) {
+            return [pscustomobject]@{
+                ShouldExit = $true
+                Success = $false
+                ExitCode = 3
+                ReasonCode = 'ElevationLaunchFailed'
+                Message = 'The elevated Windows PowerShell process could not be started.'
+            }
+        }
+        $childExitCode = 3
+        if ($null -ne $child.ExitCode) { $childExitCode = [int]$child.ExitCode }
+        return [pscustomobject]@{
+            ShouldExit = $true
+            Success = $true
+            ExitCode = $childExitCode
+            ReasonCode = $null
+            Message = $null
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            ShouldExit = $true
+            Success = $false
+            ExitCode = 3
+            ReasonCode = 'ElevationDeclined'
+            Message = ('Administrator elevation was not granted. No vendor or recovery-media operation was attempted. ' + $_.Exception.Message)
+        }
+    }
+}
+
 function Import-RecoveryAutomationModules {
     [CmdletBinding()]
     param()
@@ -2141,7 +2234,7 @@ function Invoke-RecoveryAutomation {
         $state | Add-Member -NotePropertyName MetadataPath -NotePropertyValue $case.MetadataPath -Force
         $state | Add-Member -NotePropertyName SourceProtection -NotePropertyValue $protection -Force
 
-        $lock = JobState\Acquire-RecoveryJobLock -JobPath $folderResult.JobFolderPath -LockProvider $LockProvider -Clock $Clock `
+        $lock = JobState\Lock-RecoveryJob -JobPath $folderResult.JobFolderPath -LockProvider $LockProvider -Clock $Clock `
             -Owner ('RecoveryAutomation/' + $jobId)
         if (-not $lock.Acquired) {
             return New-RecoveryAutomationResult -Success $false -ExitCode 6 -Mode 'Case' `
@@ -2429,6 +2522,18 @@ function Invoke-RecoveryAutomation {
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
+    $elevationLaunch = Invoke-RecoveryAutomationSelfElevation -ScriptPath $PSCommandPath `
+        -ConfigPath $RecoveryConfigPath -NoPause:$NoPause -DryRun:$DryRun
+    if ($elevationLaunch.ShouldExit) {
+        if ($elevationLaunch.Success) {
+            exit $elevationLaunch.ExitCode
+        }
+        $elevationResult = New-RecoveryAutomationResult -Success $false -ExitCode $elevationLaunch.ExitCode `
+            -Mode 'Elevation' -ReasonCode $elevationLaunch.ReasonCode -Message $elevationLaunch.Message `
+            -ConfigurationResult $null -VendorLaunchAttempted $false -RecoveryMediaTouched $false
+        Write-Output $elevationResult
+        exit $elevationResult.ExitCode
+    }
     $entryResult = Invoke-RecoveryAutomation -ConfigPath $RecoveryConfigPath -NoPause:$NoPause -DryRun:$DryRun
     Write-Output $entryResult
     exit $entryResult.ExitCode
