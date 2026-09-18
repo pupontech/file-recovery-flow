@@ -627,8 +627,20 @@ function New-FsUnknownLaunchResult {
         [object]$UnknownEvent
     )
 
+    # A retained identity is only ever a candidate when the launch could not be
+    # trusted: the runner reported it, the module did not verify it. Saying
+    # 'Verified' here would record an unverified process as the verified File
+    # Scavenger identity, and a later reader would treat it as evidence that the
+    # documented launch happened.
+    $retainedIdentity = $ProcessIdentity
+    if ($null -ne $retainedIdentity) {
+        $retainedIdentity = $retainedIdentity.PSObject.Copy()
+        $retainedIdentity.IdentityStatus = 'Candidate'
+        $retainedIdentity | Add-Member -NotePropertyName IdentityConfidence -NotePropertyValue 'Candidate' -Force
+    }
+
     $started = $false
-    if ($null -ne $ProcessIdentity) {
+    if ($null -ne $retainedIdentity) {
         $started = $true
     }
 
@@ -640,7 +652,7 @@ function New-FsUnknownLaunchResult {
         Reason = $Reason
         Error = $Error
         Executable = $Executable
-        ProcessIdentity = $ProcessIdentity
+        ProcessIdentity = $retainedIdentity
         Arguments = @()
         RunnerInvoked = $true
         VendorProcessPossible = $true
@@ -649,6 +661,8 @@ function New-FsUnknownLaunchResult {
         VendorActionAllowed = $false
         RequiresOperator = $true
         NeedsReview = $true
+        IdentityConfidence = 'Candidate'
+        Confidence = 'Unknown'
         SuggestedState = 'INTERRUPTED_UNKNOWN'
         ManualGate = $null
         AuthorizationEvent = $AuthorizationEvent

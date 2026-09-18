@@ -69,6 +69,7 @@ function Get-RecoveryTransitionTable {
         @{ Key = 'PREFLIGHT_PASSED|CASE_READY'; Evidence = 'CaseCreated'; Decision = $false },
         @{ Key = 'PREFLIGHT_PASSED|FAILED_CLOSED'; Evidence = $null; Decision = $false },
         @{ Key = 'CASE_READY|SHORT_SCAN_RUNNING'; Evidence = 'LaunchGateRecorded'; Decision = $false },
+        @{ Key = 'CASE_READY|INTERRUPTED_UNKNOWN'; Evidence = 'LaunchAttemptUncertain'; Decision = $false; RequiresLaunchAttempt = $true },
         @{ Key = 'CASE_READY|PAUSED'; Evidence = $null; Decision = $false },
         @{ Key = 'CASE_READY|FAILED_CLOSED'; Evidence = $null; Decision = $false },
         @{ Key = 'SHORT_SCAN_RUNNING|SHORT_SCAN_FINISHED'; Evidence = 'ScanFinished'; Decision = $false },
@@ -115,11 +116,14 @@ function Get-RecoveryTransitionTable {
         @{ Key = 'PAUSED|ABORTED'; Evidence = $null; Decision = $false },
         @{ Key = 'PAUSED|FAILED_CLOSED'; Evidence = $null; Decision = $false },
         @{ Key = 'READY_FOR_HANDOFF|HANDOFF_MANUAL'; Evidence = 'RStudioLaunchVerified'; Decision = $false },
+        @{ Key = 'READY_FOR_HANDOFF|INTERRUPTED_UNKNOWN'; Evidence = 'LaunchAttemptUncertain'; Decision = $false; RequiresLaunchAttempt = $true },
         @{ Key = 'READY_FOR_HANDOFF|PAUSED'; Evidence = $null; Decision = $false },
         @{ Key = 'READY_FOR_HANDOFF|FAILED_CLOSED'; Evidence = $null; Decision = $false }
     )
     foreach ($entry in $entries) {
-        $table[$entry.Key] = [pscustomobject]@{ Evidence = $entry.Evidence; Decision = $entry.Decision }
+        $requiresLaunchAttempt = $false
+        if ($entry.ContainsKey('RequiresLaunchAttempt')) { $requiresLaunchAttempt = [bool]$entry.RequiresLaunchAttempt }
+        $table[$entry.Key] = [pscustomobject]@{ Evidence = $entry.Evidence; Decision = $entry.Decision; RequiresLaunchAttempt = $requiresLaunchAttempt }
     }
     return $table
 }
@@ -139,29 +143,74 @@ function Get-RecoveryStateMemberValue {
     return $property.Value
 }
 
-function Get-RecoveryStateUtcInstant {
+function Get-RecoveryStateClockResult {
     param([object]$Clock)
-    if ($null -eq $Clock) { return [datetime]::UtcNow }
-    $value = $null
-    if ($Clock -is [scriptblock]) {
-        try { $value = & $Clock @{ Operation = 'NowUtc' } } catch { $value = $null }
+    if ($null -eq $Clock) {
+        return [pscustomobject]@{ IsValid = $true; Instant = [datetime]::UtcNow; ReasonCode = $null }
     }
-    else {
-        $property = $null
-        try { $property = $Clock.NowUtc } catch { $property = $null }
-        if ($property -is [scriptblock]) {
-            try { $value = & $property @{ Operation = 'NowUtc' } } catch { $value = $null }
+    $value = $null
+    try {
+        if ($Clock -is [scriptblock]) {
+            $value = & $Clock @{ Operation = 'NowUtc' }
+        }
+        else {
+            $property = $Clock.PSObject.Properties['NowUtc']
+            if ($null -ne $property) {
+                $candidate = $property.Value
+                if ($candidate -is [scriptblock]) {
+                    $value = & $candidate @{ Operation = 'NowUtc' }
+                }
+                else {
+                    $value = $candidate
+                }
+            }
         }
     }
-    if ($null -eq $value) { return [datetime]::UtcNow }
-    $instant = [datetime]$value
-    if ($instant.Kind -eq [System.DateTimeKind]::Local) { return $instant.ToUniversalTime() }
-    return $instant
+    catch {
+        return [pscustomobject]@{ IsValid = $false; Instant = $null; ReasonCode = 'ClockInvalid' }
+    }
+    if ($null -eq $value -or $value -is [System.Array]) {
+        return [pscustomobject]@{ IsValid = $false; Instant = $null; ReasonCode = 'ClockInvalid' }
+    }
+    if ($value -is [datetime]) {
+        $instant = [datetime]$value
+    }
+    elseif ($value -is [datetimeoffset]) {
+        $instant = $value.UtcDateTime
+    }
+    elseif ($value -is [string]) {
+        $parsed = [datetime]::MinValue
+        $text = ([string]$value).Trim()
+        # An explicitly zoned string keeps its zone offset; the fallback covers the
+        # zoneless local form a DateTime cast produces on the round trip through a
+        # string parameter.
+        $zoned = [datetimeoffset]::MinValue
+        if ([datetimeoffset]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$zoned)) {
+            $parsed = $zoned.UtcDateTime
+        }
+        elseif (-not [datetime]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal, [ref]$parsed)) {
+            return [pscustomobject]@{ IsValid = $false; Instant = $null; ReasonCode = 'ClockInvalid' }
+        }
+        $instant = $parsed
+    }
+    else {
+        return [pscustomobject]@{ IsValid = $false; Instant = $null; ReasonCode = 'ClockInvalid' }
+    }
+    if ($instant.Kind -eq [System.DateTimeKind]::Local) { $instant = $instant.ToUniversalTime() }
+    return [pscustomobject]@{ IsValid = $true; Instant = $instant; ReasonCode = $null }
+}
+
+function Get-RecoveryStateUtcInstant {
+    param([object]$Clock)
+    $clockResult = Get-RecoveryStateClockResult -Clock $Clock
+    if (-not $clockResult.IsValid) { return $null }
+    return $clockResult.Instant
 }
 
 function Format-RecoveryStateTimestamp {
     param([object]$Clock)
     $instant = Get-RecoveryStateUtcInstant -Clock $Clock
+    if ($null -eq $instant) { return $null }
     return $instant.ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
@@ -200,8 +249,141 @@ function Compare-RecoveryIdentitySnapshot {
     if ($recordedKeys.Count -eq 0 -or $freshKeys.Count -eq 0) { return 'Indeterminate' }
     $recordedText = (($recordedKeys | Sort-Object) -join '|')
     $freshText = (($freshKeys | Sort-Object) -join '|')
-    if ($recordedText.Equals($freshText, [System.StringComparison]::OrdinalIgnoreCase)) { return 'Match' }
+    if (-not $recordedText.Equals($freshText, [System.StringComparison]::OrdinalIgnoreCase)) { return 'Changed' }
+    # Identity keys alone do not identify a volume. Two different volumes can
+    # publish the same member key, so every dimension the two snapshots can state
+    # is compared: a snapshot that describes this path only through its keys must
+    # never be read as the snapshot of a different volume that shares those keys.
+    foreach ($name in @('VolumeGuid', 'VolumePath', 'CanonicalPath', 'Path')) {
+        $verdict = Compare-RecoveryStateIdentityField -Recorded $Recorded -Fresh $Fresh -Name $name
+        if ($verdict -eq 'Changed') { return 'Changed' }
+    }
+    $diskVerdict = Compare-RecoveryStateIdentityDisks -Recorded $Recorded -Fresh $Fresh
+    if ($diskVerdict -eq 'Changed') { return 'Changed' }
+    return 'Match'
+}
+
+function ConvertTo-RecoveryStateIdentityValue {
+    param([object]$Value)
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [System.Array]) { return '' }
+    return ([string]$Value).Trim()
+}
+
+function Compare-RecoveryStateIdentityField {
+    # One identity dimension is a conflict only when both snapshots state it as a
+    # single non-empty value and the two values disagree. A dimension one side
+    # cannot state is incomplete evidence: it is never read as agreement with a
+    # different value, and it is not a contradiction of the value the other side
+    # states. Two snapshots that both state the same volume, path, and member key
+    # are the same identity even when one of them describes fewer optional
+    # fields, which is exactly the pair a resume produces.
+    param(
+        [object]$Recorded,
+        [object]$Fresh,
+        [string]$Name
+    )
+    $recordedValue = ConvertTo-RecoveryStateIdentityValue (Get-RecoveryStateMemberValue -Object $Recorded -Name $Name)
+    $freshValue = ConvertTo-RecoveryStateIdentityValue (Get-RecoveryStateMemberValue -Object $Fresh -Name $Name)
+    if ($recordedValue.Length -eq 0 -or $freshValue.Length -eq 0) { return 'Match' }
+    if ($recordedValue.Equals($freshValue, [System.StringComparison]::OrdinalIgnoreCase)) { return 'Match' }
     return 'Changed'
+}
+
+function Compare-RecoveryStateIdentityDisks {
+    # The physical member set is a mandatory part of the identity when either
+    # snapshot states one: the same keys with a different member count, a
+    # non-Boolean or absent single-disk member state, or a member described
+    # through different evidence are all conflicts.
+    param(
+        [object]$Recorded,
+        [object]$Fresh
+    )
+    $recordedDisks = @(ConvertTo-RecoveryArray -Value (Get-RecoveryStateMemberValue -Object $Recorded -Name 'PhysicalDisks'))
+    $freshDisks = @(ConvertTo-RecoveryArray -Value (Get-RecoveryStateMemberValue -Object $Fresh -Name 'PhysicalDisks'))
+    if ($recordedDisks.Count -eq 0 -and $freshDisks.Count -eq 0) { return 'Match' }
+    if ($recordedDisks.Count -eq 0 -or $freshDisks.Count -eq 0) { return 'Changed' }
+    if ($recordedDisks.Count -ne $freshDisks.Count) { return 'Changed' }
+    # A member number is only a conflict when both snapshots state one for that
+    # member and the two numbers differ. Counts are not compared on their own: a
+    # snapshot that describes its member through the identity key is incomplete,
+    # not contradictory, so a single member stated without a number is compared
+    # through its key and its disk evidence.
+    $recordedNumbers = @(Get-RecoveryStateDiskNumbers -Disks $recordedDisks)
+    $freshNumbers = @(Get-RecoveryStateDiskNumbers -Disks $freshDisks)
+    if ($recordedNumbers.Count -eq $freshNumbers.Count -and $recordedNumbers.Count -gt 0) {
+        $recordedNumberText = (($recordedNumbers | Sort-Object) -join '|')
+        $freshNumberText = (($freshNumbers | Sort-Object) -join '|')
+        if (-not $recordedNumberText.Equals($freshNumberText, [System.StringComparison]::Ordinal)) { return 'Changed' }
+    }
+    elseif ($recordedNumbers.Count -gt 1 -or $freshNumbers.Count -gt 1) {
+        # One side states several member numbers where the other states none or
+        # one: the member sets cannot be the same set described twice.
+        return 'Changed'
+    }
+    $recordedKeys = @((Get-RecoveryStateIdentityKeys -Identity $Recorded) | Sort-Object)
+    $freshKeys = @((Get-RecoveryStateIdentityKeys -Identity $Fresh) | Sort-Object)
+    if ($recordedKeys.Count -ne $freshKeys.Count) { return 'Changed' }
+    for ($index = 0; $index -lt $recordedKeys.Count; $index++) {
+        if (-not ([string]$recordedKeys[$index]).Equals([string]$freshKeys[$index], [System.StringComparison]::OrdinalIgnoreCase)) { return 'Changed' }
+    }
+    foreach ($diskIndex in 0..($recordedDisks.Count - 1)) {
+        $recordedDisk = $recordedDisks[$diskIndex]
+        $freshDisk = $freshDisks[$diskIndex]
+        if ($null -eq $recordedDisk -or $null -eq $freshDisk) { return 'Changed' }
+        foreach ($name in @('IdentityKey', 'UniqueId', 'UniqueIdFormat', 'SerialNumber')) {
+            $verdict = Compare-RecoveryStateIdentityField -Recorded $recordedDisk -Fresh $freshDisk -Name $name
+            if ($verdict -eq 'Changed') { return 'Changed' }
+        }
+        foreach ($name in @('IsIndeterminate', 'DiskNumber')) {
+            $recordedProperty = $recordedDisk.PSObject.Properties[$name]
+            $freshProperty = $freshDisk.PSObject.Properties[$name]
+            if ($null -eq $recordedProperty -and $null -eq $freshProperty) { continue }
+            if ($name -eq 'IsIndeterminate') {
+                # A member state that cannot be stated as one Boolean is not proof
+                # of a single-disk member, so it is a conflict; a member that omits
+                # the flag entirely is compared through its key like any other
+                # member that states less.
+                if ($null -ne $recordedProperty -and $null -ne $freshProperty) {
+                    if ($recordedProperty.Value -isnot [bool] -or $freshProperty.Value -isnot [bool]) { return 'Changed' }
+                    if ($recordedProperty.Value -ne $freshProperty.Value) { return 'Changed' }
+                    continue
+                }
+                $stated = $recordedProperty
+                if ($null -eq $stated) { $stated = $freshProperty }
+                if ($stated.Value -isnot [bool]) { return 'Changed' }
+                if ($stated.Value -eq $true) { return 'Changed' }
+            }
+            else {
+                # DiskNumber is compared only when both snapshots state it: a
+                # snapshot that identifies its member through the key alone is
+                # incomplete, not contradictory, and a disagreement between two
+                # stated member numbers is still a change.
+                if ($null -eq $recordedProperty -or $null -eq $freshProperty) { continue }
+                if ([string]$recordedProperty.Value -ne [string]$freshProperty.Value) { return 'Changed' }
+            }
+        }
+    }
+    return 'Match'
+}
+
+function Get-RecoveryStateDiskNumbers {
+    # Only a member that actually states a member number contributes one. A member
+    # that identifies itself through its key alone is an incomplete statement, not
+    # a statement of the empty number: an empty placeholder used to make a member
+    # without a number compare unequal to the same member with one, which refused
+    # legitimate resume pairs.
+    param([object[]]$Disks)
+    $numbers = New-Object System.Collections.Generic.List[string]
+    foreach ($disk in $Disks) {
+        if ($null -eq $disk) { continue }
+        $value = Get-RecoveryStateMemberValue -Object $disk -Name 'DiskNumber'
+        if ($null -eq $value -or $value -is [bool]) { continue }
+        $text = ([string]$value).Trim()
+        if ($text.Length -eq 0) { continue }
+        $numbers.Add($text) | Out-Null
+    }
+    return $numbers.ToArray()
 }
 
 function Test-RecoveryJobStateShape {
@@ -499,29 +681,11 @@ function Invoke-RecoveryStateProviderCall {
 }
 
 function Get-RecoveryStateUtcNow {
-    # Single clock seam for lease decisions. A missing or unusable clock is
-    # refused by the caller rather than silently replaced with wall-clock time,
-    # except when no clock was supplied at all.
+    # Single clock seam for lease decisions. A supplied clock that is missing,
+    # array-valued, throwing, or unparsable returns no instant; callers must
+    # report ClockInvalid rather than silently replacing it with wall-clock time.
     param([object]$Clock = $null)
-    if ($null -eq $Clock) { return [datetime]::UtcNow }
-    $value = $null
-    if ($Clock -is [scriptblock]) {
-        try { $value = & $Clock @{ Operation = 'NowUtc' } } catch { $value = $null }
-    }
-    else {
-        $property = $Clock.PSObject.Properties['NowUtc']
-        if ($null -ne $property) {
-            $candidate = $property.Value
-            if ($candidate -is [scriptblock]) {
-                try { $value = & $candidate @{ Operation = 'NowUtc' } } catch { $value = $null }
-            }
-            else { $value = $candidate }
-        }
-    }
-    if ($null -eq $value) { return [datetime]::UtcNow }
-    $instant = [datetime]$value
-    if ($instant.Kind -eq [System.DateTimeKind]::Local) { return $instant.ToUniversalTime() }
-    return $instant
+    return Get-RecoveryStateUtcInstant -Clock $Clock
 }
 
 function Get-RecoveryStateBindingCheck {
@@ -666,6 +830,11 @@ function Get-RecoveryStateBindingCheck {
         # worker can still read resume state.
         $leaseInstant = [datetime]::Parse([string]$lockLease, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal)
         $nowInstant = Get-RecoveryStateUtcNow -Clock $Clock
+        if ($null -eq $nowInstant) {
+            $result.ReasonCode = 'ClockInvalid'
+            $result.Message = 'The supplied clock did not produce one readable UTC instant.'
+            return $result
+        }
         if ($nowInstant -ge $leaseInstant) {
             $result.ReasonCode = 'LockLeaseExpired'
             $result.Message = 'The job lock lease has expired, so this read is refused until the lock is reacquired.'
@@ -898,10 +1067,25 @@ function Test-RecoveryStateTransition {
     $evidence = $null
     $decision = $null
     $attemptId = $null
+    $launchAttemptUncertain = $null
     if ($null -ne $Context) {
         if ($Context.ContainsKey('Evidence')) { $evidence = $Context['Evidence'] }
         if ($Context.ContainsKey('OperatorDecision')) { $decision = $Context['OperatorDecision'] }
         if ($Context.ContainsKey('NewAttemptId')) { $attemptId = $Context['NewAttemptId'] }
+        if ($Context.ContainsKey('LaunchAttemptUncertain')) { $launchAttemptUncertain = $Context['LaunchAttemptUncertain'] }
+    }
+    # A launch outcome that cannot be proven either way records a durable unknown.
+    # The attempt context must be stated as the literal Boolean true: an absent,
+    # string, or otherwise non-Boolean value is not evidence that a launch was
+    # attempted, so this edge can never be used as a generic bypass into
+    # INTERRUPTED_UNKNOWN.
+    if ($edge.RequiresLaunchAttempt) {
+        $stated = (($launchAttemptUncertain -is [bool]) -and ($launchAttemptUncertain -eq $true))
+        if (-not $stated) {
+            $result.ReasonCode = 'LaunchAttemptUncertaintyNotStated'
+            $result.Message = 'This transition requires an explicit statement that a launch was attempted and its outcome is unknown.'
+            return $result
+        }
     }
     if ($edge.Evidence) {
         if ($null -eq $evidence -or ([string]$evidence).Trim() -ne $edge.Evidence) {
@@ -1177,6 +1361,11 @@ function Lock-RecoveryJob {
     $lockPath = Join-Path -Path $jobFolder -ChildPath 'job.lock'
     $result.LockPath = $lockPath
     $now = Get-RecoveryStateUtcInstant -Clock $Clock
+    if ($null -eq $now) {
+        $result.ReasonCode = 'ClockInvalid'
+        $result.Message = 'The supplied clock did not produce one readable UTC instant.'
+        return $result
+    }
     $expires = $now.AddMinutes($LeaseMinutes)
     $result.LeaseExpiresUtc = $expires.ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [System.Globalization.CultureInfo]::InvariantCulture)
     if ($null -eq $LockProvider) { $LockProvider = Get-RecoveryDefaultLockProvider }
