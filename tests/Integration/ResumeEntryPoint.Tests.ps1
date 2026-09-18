@@ -182,6 +182,58 @@ BeforeAll {
         }.GetNewClosure()
         return [pscustomobject]@{ Calls = $record; Refuse = $boom }
     }
+
+    function Compare-ResumeInventory {
+        param(
+            [string[]]$ActualNames,
+            [string[]]$ExpectedNames
+        )
+        $actual = @($ActualNames | ForEach-Object { [string]$_ })
+        $expected = @($ExpectedNames | ForEach-Object { [string]$_ })
+        $actualCounts = [System.Collections.Generic.Dictionary[string,int]]::new([System.StringComparer]::Ordinal)
+        $expectedCounts = [System.Collections.Generic.Dictionary[string,int]]::new([System.StringComparer]::Ordinal)
+        foreach ($name in $actual) {
+            if ($actualCounts.ContainsKey($name)) {
+                $actualCounts[$name] = $actualCounts[$name] + 1
+            }
+            else {
+                $actualCounts.Add($name, 1)
+            }
+        }
+        foreach ($name in $expected) {
+            if ($expectedCounts.ContainsKey($name)) {
+                $expectedCounts[$name] = $expectedCounts[$name] + 1
+            }
+            else {
+                $expectedCounts.Add($name, 1)
+            }
+        }
+        $missing = New-Object 'System.Collections.Generic.List[string]'
+        $unexpected = New-Object 'System.Collections.Generic.List[string]'
+        $duplicates = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($name in $expectedCounts.Keys) {
+            if (-not $actualCounts.ContainsKey($name)) {
+                $missing.Add($name) | Out-Null
+            }
+        }
+        foreach ($name in $actualCounts.Keys) {
+            if (-not $expectedCounts.ContainsKey($name)) {
+                $unexpected.Add($name) | Out-Null
+            }
+            if ($actualCounts[$name] -gt 1) {
+                $duplicates.Add($name) | Out-Null
+            }
+        }
+        return [pscustomobject]@{
+            Valid           = ($actual.Count -eq $expected.Count -and $missing.Count -eq 0 -and $unexpected.Count -eq 0 -and $duplicates.Count -eq 0)
+            ActualCount     = $actual.Count
+            ExpectedCount   = $expected.Count
+            UniqueCount     = $actualCounts.Count
+            MissingNames    = @($missing.ToArray())
+            UnexpectedNames = @($unexpected.ToArray())
+            DuplicateNames  = @($duplicates.ToArray())
+        }
+    }
 }
 
 Describe 'Resume entry point' {
@@ -282,9 +334,35 @@ Describe 'Resume entry point' {
         # The only file the refusal adds is the lock the resume acquired, which is
         # the acquisition the resume contract mandates; no state, log, metadata, or
         # claim byte is written.
-        $entries = @([System.IO.Directory]::GetFileSystemEntries($case.Folder) | ForEach-Object { [System.IO.Path]::GetFileName([string]$_) } | Sort-Object)
-        ($entries -join ',') | Should -Be (@('events.jsonl', 'job-claim.json', 'job-state.json', 'job.lock') -join ',')
+        $expectedEntries = @('events.jsonl', 'job-claim.json', 'job-state.json', 'job.lock')
+        $entries = @([System.IO.Directory]::GetFileSystemEntries($case.Folder) | ForEach-Object { [System.IO.Path]::GetFileName([string]$_) })
+        $inventory = Compare-ResumeInventory -ActualNames $entries -ExpectedNames $expectedEntries
+        $inventory.ActualCount | Should -Be 4
+        $inventory.ExpectedCount | Should -Be 4
+        $inventory.UniqueCount | Should -Be 4
+        $inventory.DuplicateNames | Should -HaveCount 0
+        $inventory.MissingNames | Should -HaveCount 0
+        $inventory.UnexpectedNames | Should -HaveCount 0
+        $inventory.Valid | Should -BeTrue
         (Test-Path -LiteralPath (Join-Path -Path $case.Folder -ChildPath 'case-metadata.json')) | Should -BeFalse
+    }
+
+    It 'rejects missing, extra, and duplicate resume inventory names' {
+        $expectedEntries = @('events.jsonl', 'job-claim.json', 'job-state.json', 'job.lock')
+
+        $missing = Compare-ResumeInventory -ActualNames @('job.lock', 'events.jsonl', 'job-state.json') -ExpectedNames $expectedEntries
+        $missing.Valid | Should -BeFalse
+        $missing.MissingNames | Should -Contain 'job-claim.json'
+        $missing.UnexpectedNames | Should -HaveCount 0
+
+        $extra = Compare-ResumeInventory -ActualNames @('job.lock', 'events.jsonl', 'job-state.json', 'job-claim.json', 'unexpected.tmp') -ExpectedNames $expectedEntries
+        $extra.Valid | Should -BeFalse
+        $extra.UnexpectedNames | Should -Contain 'unexpected.tmp'
+        $extra.MissingNames | Should -HaveCount 0
+
+        $duplicate = Compare-ResumeInventory -ActualNames @('job.lock', 'events.jsonl', 'job-state.json', 'job-claim.json', 'job.lock') -ExpectedNames $expectedEntries
+        $duplicate.Valid | Should -BeFalse
+        $duplicate.DuplicateNames | Should -Contain 'job.lock'
     }
 
     It 'refuses a resume whose recorded source identity no longer matches' {
