@@ -1734,6 +1734,195 @@ function New-RecoveryAutomationStageResult {
     }
 }
 
+function Test-RecoveryAutomationUnknownTransitionDurable {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][object]$Transition,
+        [Parameter(Mandatory = $true)][AllowNull()][object]$StatePath
+    )
+
+    # A transition may only be called durable when the framework reported success
+    # AND the snapshot on disk, read back through the same binding gate a resume
+    # uses, actually holds the unknown state. A writer that returns success
+    # without changing the file must not be believed.
+    if ($null -eq $Transition -or $Transition.Success -ne $true) { return $false }
+    if ($null -eq $StatePath -or [string]::IsNullOrWhiteSpace([string]$StatePath)) { return $false }
+    if (-not [System.IO.File]::Exists([string]$StatePath)) { return $false }
+    try {
+        $snapshot = ([System.IO.File]::ReadAllText([string]$StatePath, (New-Object System.Text.UTF8Encoding($false))) | ConvertFrom-Json -ErrorAction Stop)
+    }
+    catch {
+        return $false
+    }
+    if ($null -eq $snapshot) { return $false }
+    return ([string]$snapshot.State -eq 'INTERRUPTED_UNKNOWN')
+}
+
+function New-RecoveryAutomationInterruptedUnknownStateResult {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][object]$Case,
+        [Parameter(Mandatory = $true)][object]$LaunchOutcome,
+        [Parameter(Mandatory = $true)][object]$Context,
+        [string]$Stage = 'LAUNCH',
+        [string]$ReasonCode = '',
+        [string]$Message = '',
+        [bool]$LaunchAttempted = $true
+    )
+
+    # A launch whose outcome is unknown is never a clean failure: the vendor
+    # process may be running, so the attempt is made durably INTERRUPTED_UNKNOWN
+    # and the candidate process identity is retained with an explicit unknown
+    # confidence. Nothing is retried, nothing is closed, and no later stage is
+    # authorized. When the unknown state cannot be made durable the run stops
+    # hard with a distinct reason code instead of continuing or claiming the
+    # transition landed.
+    if ([string]::IsNullOrWhiteSpace($ReasonCode)) { $ReasonCode = [string]$LaunchOutcome.ReasonCode }
+    if ([string]::IsNullOrWhiteSpace($Message)) { $Message = [string]$LaunchOutcome.Reason }
+    $statePath = Get-RecoveryAutomationValue -InputObject $Case -Names @('StatePath')
+    $contract = [pscustomobject]@{
+        EventType             = 'StageInterruptedUnknown'
+        RequestedState        = 'INTERRUPTED_UNKNOWN'
+        Result                = [string]$LaunchOutcome.Result
+        Reason                = 'VendorLaunchOutcomeUnknown'
+        ReasonCode            = $ReasonCode
+        Stage                 = $Stage
+        AttemptId             = [string]$State.AttemptId
+        RunnerInvoked         = [bool]$LaunchOutcome.RunnerInvoked
+        VendorProcessPossible = [bool]$LaunchOutcome.VendorProcessPossible
+        Started               = [bool]$LaunchOutcome.Started
+        IdentityConfidence    = 'Candidate'
+        Confidence            = 'Unknown'
+        RetryAllowed          = $false
+        CloseAllowed          = $false
+        VendorActionAllowed   = $false
+    }
+    if ($null -ne $LaunchOutcome.ProcessIdentity) {
+        $State | Add-Member -NotePropertyName ProcessIdentity -NotePropertyValue $LaunchOutcome.ProcessIdentity -Force
+    }
+    if ($null -ne $LaunchOutcome.UnknownEvent -and $LaunchOutcome.UnknownEvent.Attempted -eq $true) {
+        # The injected test writer is the recorded unknown event; the production
+        # boundary writer reports the sequence instead.
+        $State | Add-Member -NotePropertyName InterruptedUnknownEvent -NotePropertyValue ([pscustomobject]@{
+                Attempted   = $true
+                Succeeded   = [bool]$LaunchOutcome.UnknownEvent.Succeeded
+                ReasonCode  = [string]$LaunchOutcome.UnknownEvent.ReasonCode
+            }) -Force
+    }
+    $transition = JobState\Set-RecoveryState -State $State -To 'INTERRUPTED_UNKNOWN' `
+        -EventWriter $Context.EventWriter -StateWriter $Context.StateWriter `
+        -Context @{ EventType = 'StageInterruptedUnknown'; Result = 'NeedsReview'; Reason = 'VendorLaunchOutcomeUnknown'; Error = $ReasonCode } `
+        -Clock $Context.Clock
+    $unknownDurable = Test-RecoveryAutomationUnknownTransitionDurable -Transition $transition -StatePath $statePath
+    if (-not $unknownDurable) {
+        $reason = 'InterruptedUnknownStateNotDurable'
+        $failureMessage = 'The vendor launch outcome is unknown and the attempt could not be durably recorded as INTERRUPTED_UNKNOWN, so the run stopped: ' + [string]$transition.Message
+        if ($transition.Success -ne $true -and -not [string]::IsNullOrWhiteSpace([string]$transition.ReasonCode)) {
+            $reason = [string]$transition.ReasonCode
+        }
+        $State | Add-Member -NotePropertyName LaunchOutcomeContract -NotePropertyValue $contract -Force
+        return New-RecoveryAutomationResult -Success $false -ExitCode 7 -Mode 'FileScavenger' `
+            -ReasonCode $reason -Message $failureMessage `
+            -ConfigurationResult $Context.ConfigurationResult -VendorLaunchAttempted $LaunchAttempted `
+            -RecoveryMediaTouched $Context.MediaTouched -Runtime $Context.Runtime -Applications $Context.Applications `
+            -SourceIdentity $State.SourceIdentity -DestinationIdentity $State.DestinationIdentity `
+            -Capacity $State.CapacityPolicy -Case $Case -State $State
+    }
+    $State | Add-Member -NotePropertyName LaunchOutcomeContract -NotePropertyValue $contract -Force
+    $State | Add-Member -NotePropertyName InterruptedUnknownDurable -NotePropertyValue $true -Force
+    return New-RecoveryAutomationResult -Success $false -ExitCode 7 -Mode 'FileScavenger' `
+        -ReasonCode $ReasonCode -Message (($Message) + ' The attempt is durably INTERRUPTED_UNKNOWN with its candidate process identity retained; the workflow stopped and no later stage was authorized.') `
+        -ConfigurationResult $Context.ConfigurationResult -VendorLaunchAttempted $LaunchAttempted `
+        -RecoveryMediaTouched $Context.MediaTouched -Runtime $Context.Runtime -Applications $Context.Applications `
+        -SourceIdentity $State.SourceIdentity -DestinationIdentity $State.DestinationIdentity `
+        -Capacity $State.CapacityPolicy -Case $Case -State $State
+}
+
+function New-RecoveryAutomationInterruptedUnknownHandoffResult {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][AllowNull()][object]$Handoff,
+        [Parameter(Mandatory = $true)][AllowNull()][object]$Preconditions,
+        [Parameter(Mandatory = $true)][AllowNull()][object]$EventWriter,
+        [AllowNull()][object]$StateWriter = $null,
+        [AllowNull()][object]$Clock = $null
+    )
+
+    # R-Studio was invoked but its launch could not be verified, or it started and
+    # the handoff state could not be made durable. Either way an R-Studio process
+    # may be running at the documented manual boundary, so this is never an
+    # ordinary failed/blocked handoff: the attempt becomes durably
+    # INTERRUPTED_UNKNOWN, the candidate identity is retained with an unknown
+    # confidence, and nothing is retried or force-closed.
+    $reason = [string]$Handoff.ReasonCode
+    if ([string]::IsNullOrWhiteSpace($reason)) { $reason = 'HandoffOutcomeUnknown' }
+    $verification = Get-RecoveryAutomationValue -InputObject $State -Names @('HandoffTransitionVerification')
+    if ($null -ne $verification -and $verification.Attempted -eq $true) { $reason = [string]$verification.ReasonCode }
+    $statePath = [string](Get-RecoveryAutomationValue -InputObject $State.Paths -Names @('StatePath'))
+    $State | Add-Member -NotePropertyName LaunchOutcome -NotePropertyValue ([pscustomobject]@{
+            Result                = 'HandoffReview'
+            ReasonCode            = $reason
+            RunnerInvoked         = [bool]$Handoff.RunnerInvoked
+            VendorProcessPossible = [bool]$Handoff.VendorProcessPossible
+            Started               = $true
+            IdentityConfidence    = 'Candidate'
+            Confidence            = 'Unknown'
+            RetryAllowed          = $false
+            CloseAllowed          = $false
+            ForcedCloseAllowed    = $false
+            VendorActionAllowed   = $false
+        }) -Force
+    if ($null -ne $Handoff.ProcessIdentity) {
+        $State | Add-Member -NotePropertyName ProcessIdentity -NotePropertyValue $Handoff.ProcessIdentity -Force
+    }
+    $transition = JobState\Set-RecoveryState -State $State -To 'INTERRUPTED_UNKNOWN' -EventWriter $EventWriter `
+        -StateWriter $StateWriter -Context @{ EventType = 'StageInterruptedUnknown'; Result = 'NeedsReview'; Reason = 'HandoffOutcomeUnknown'; Error = $reason } `
+        -Clock $Clock
+    $unknownDurable = Test-RecoveryAutomationUnknownTransitionDurable -Transition $transition -StatePath $statePath
+    if (-not $unknownDurable) {
+        try {
+            [void](& $EventWriter ([pscustomobject]@{
+                        JobId = [string]$State.JobId
+                        State = [string]$State.State
+                        Stage = 'HANDOFF'
+                        AttemptId = $null
+                        EventType = 'StageFailed'
+                        Result = 'Failed'
+                        SourceIdentity = $State.SourceIdentity
+                        DestinationIdentity = $State.DestinationIdentity
+                        Decision = $null
+                        Error = $reason
+                        Gate = $null
+                    }))
+        }
+        catch { }
+        return [pscustomobject]@{
+            Allowed = $false
+            Handoff = $Handoff
+            State = $State
+            ReasonCode = 'HandoffInterruptedUnknownNotDurable'
+            Message = 'R-Studio may be running and the attempt could not be durably recorded as INTERRUPTED_UNKNOWN; the handoff stopped and claims nothing.'
+            LaunchAttempted = [bool]$Handoff.RunnerInvoked
+            Launched = $false
+            AnalysisInvoked = $false
+            Preconditions = $Preconditions
+        }
+    }
+    return [pscustomobject]@{
+        Allowed = $false
+        Handoff = $Handoff
+        State = $State
+        ReasonCode = $reason
+        Message = 'R-Studio was invoked but its launch could not be verified, so the attempt is durably INTERRUPTED_UNKNOWN with its candidate process identity retained and requires operator review. Nothing was retried and no process was closed.'
+        LaunchAttempted = $true
+        Launched = $false
+        AnalysisInvoked = $false
+        Preconditions = $Preconditions
+    }
+}
+
 function Invoke-RecoveryAutomationStage {
     [CmdletBinding()]
     param(
@@ -2444,6 +2633,17 @@ function Invoke-RecoveryAutomationHandoff {
         -ProcessRunner $ProcessRunner -LogPathSafetyValidator $LogPathSafetyValidator `
         -FreshEvidenceProvider $FreshEvidenceProvider -ActivationProvider $ActivationProvider
     $blocked.LaunchAttempted = $true
+    # An unverified launch outcome while an R-Studio process may exist is never an
+    # ordinary failure. The documented manual boundary has already been reached,
+    # so a plain failure would invite a retry that starts a second vendor process
+    # or closes one that is still working: the attempt is made durably
+    # INTERRUPTED_UNKNOWN instead.
+    $unknownLaunch = (-not [bool]$handoff.Launched) -and
+        ($null -ne $handoff.ProcessIdentity -or (Test-RecoveryAutomationBoolean (Get-RecoveryAutomationValue -InputObject $handoff -Names @('RunnerInvoked', 'VendorProcessPossible'))))
+    if ($unknownLaunch) {
+        return New-RecoveryAutomationInterruptedUnknownHandoffResult -State $State -Handoff $handoff `
+            -Preconditions $preconditions -EventWriter $EventWriter -StateWriter $StateWriter -Clock $Clock
+    }
     if (-not $handoff.Launched) {
         try { [void](& $EventWriter ([pscustomobject]@{
                     JobId = [string]$State.JobId
@@ -2459,7 +2659,7 @@ function Invoke-RecoveryAutomationHandoff {
                     Gate = $null
                 })) } catch { }
         $blocked.ReasonCode = $handoff.ReasonCode
-        $blocked.Message = 'R-Studio launch failed or returned no verified process identity.'
+        $blocked.Message = ('R-Studio was not launched: the launch orchestration refused before the vendor process started. ' + [string]$handoff.ReasonCode)
         $blocked.Handoff = $handoff
         $blocked | Add-Member -NotePropertyName Preconditions -NotePropertyValue $preconditions -Force
         return $blocked
@@ -2471,12 +2671,25 @@ function Invoke-RecoveryAutomationHandoff {
     $transition = JobState\Set-RecoveryState -State $State -To 'HANDOFF_MANUAL' -EventWriter $EventWriter `
         -StateWriter $StateWriter -Context @{ Evidence = 'RStudioLaunchVerified'; Stage = 'HANDOFF'; AttemptId = $State.AttemptId; EventType = 'RStudioLaunchOnlyHandoff' } -Clock $Clock
     if (-not $transition.Success) {
-        $blocked.ReasonCode = $transition.ReasonCode
-        $blocked.Message = 'R-Studio started, but the handoff state could not be durably recorded.'
-        $blocked.Handoff = $handoff
-        $blocked | Add-Member -NotePropertyName Preconditions -NotePropertyValue $preconditions -Force
-        return $blocked
+        # The vendor process is already running, so this is not a clean handoff
+        # failure either: the run must not claim the handoff transition landed,
+        # and it must not continue as though the case were still pre-launch. The
+        # started attempt is recorded as durably unknown when it can be.
+        $State | Add-Member -NotePropertyName HandoffTransitionVerification -NotePropertyValue ([pscustomobject]@{
+                Attempted  = $true
+                Succeeded  = $false
+                ReasonCode = 'HandoffStateNotDurable'
+                Message    = [string]$transition.Message
+            }) -Force
+        return New-RecoveryAutomationInterruptedUnknownHandoffResult -State $State -Handoff $handoff `
+            -Preconditions $preconditions -EventWriter $EventWriter -StateWriter $StateWriter -Clock $Clock
     }
+    $State | Add-Member -NotePropertyName HandoffTransitionVerification -NotePropertyValue ([pscustomobject]@{
+            Attempted = $true
+            Succeeded = $true
+            ReasonCode = $null
+            Message = $null
+        }) -Force
     return [pscustomobject]@{
         Allowed = $true
         Handoff = $handoff
@@ -2597,18 +2810,29 @@ function Get-RecoveryAutomationResumeRoute {
         Stage             = $null
         AttemptIdSuffix   = $null
         LaunchGateRequired = $false
+        # The evidence this hop names describes the case the resume already read
+        # from disk: it is not a statement that this process performed an action.
+        RequiresRecordedVendorAction = $false
         ManualAction      = 'The durable case folder, claim marker, lock, and log are present. Record that the case is ready and continue before any vendor action.'
     }
     $routes['CASE_READY|SHORT_SCAN_RUNNING'] = [pscustomobject]@{
         Stage             = 'SHORT_SCAN'
         AttemptIdSuffix   = 'short-scan'
         LaunchGateRequired = $true
+        # The technician's recorded launch-gate decision is what authorizes this
+        # hop, and it is presented and recorded by this route before the
+        # transition is taken.
+        RequiresRecordedVendorAction = $false
         ManualAction      = 'Start the documented File Scavenger session yourself and perform Look in, Look for, Quick scan, and Step 2: Save. This process never relaunches a vendor program on resume.'
     }
     $routes['SHORT_RECOVERY_VERIFIED|LONG_SCAN_RUNNING'] = [pscustomobject]@{
         Stage             = 'LONG_SCAN'
         AttemptIdSuffix   = 'long-scan'
         LaunchGateRequired = $false
+        # This hop states 'LongScanApproved', which is only true once the Long
+        # scan has actually been approved and started. A resume performs no scan,
+        # so it can never record that evidence honestly.
+        RequiresRecordedVendorAction = $true
         ManualAction      = 'Perform the documented Long scan and Step 2: Save in the File Scavenger session you already have open. The verified short recovery stage is never rerun.'
     }
     $key = $From + '|' + $To
@@ -2875,6 +3099,18 @@ function Invoke-RecoveryAutomationResume {
         if (-not $probe.Allowed -and [string]$probe.ReasonCode -ne 'MissingEvidence') {
             return New-RecoveryAutomationResumeResult -ReasonCode 'ResumeTransitionRefused' -ExitCode 6 `
                 -Message ('The routed transition is not available to a resume: ' + [string]$probe.Message) -Context $context
+        }
+        if (Test-RecoveryAutomationBoolean (Get-RecoveryAutomationValue -InputObject $route -Names @('RequiresRecordedVendorAction'))) {
+            # The routed transition demands a specific recorded action that this
+            # process did not perform. Supplying it here would fabricate the
+            # evidence of an action that never happened: 'LongScanApproved' is a
+            # statement that a Long scan was approved and started, and a resume
+            # never starts one. The state therefore stays at its last verified
+            # value and the technician continues the documented stage as the
+            # manual action the route describes.
+            return New-RecoveryAutomationResumeResult -ReasonCode 'ResumeNextStageNotAuthorized' -ExitCode 8 `
+                -Message ('The case stays at ' + [string]$state.State + ' because the routed transition to ' + [string]$decision.NextState + ' requires the recorded ' + [string]$probe.RequiredEvidence + ' authorization, which only the documented manual vendor action can produce. No vendor process was launched, no scan was started, and no attempt id was invented. ' + [string]$route.ManualAction) `
+                -Context $context
         }
         $launchGate = $null
         if ($route.LaunchGateRequired) {
@@ -3463,8 +3699,35 @@ function Invoke-RecoveryAutomation {
         if ($null -eq $fsRunner) { $fsRunner = $VendorProcessRunner }
         $startResult = FileScavenger\Start-FileScavenger -Executable $fsExecutable -State $state `
             -Preconditions $state.Preconditions -ProcessRunner $fsRunner -EventWriter $eventWriter
-        $launchAttempted = $true
+        # The reported launch attempt follows what the vendor boundary actually
+        # did: a refusal that never reached the process runner is not a vendor
+        # launch attempt, and an unknown outcome that did reach it always is.
+        $runnerInvoked = Test-RecoveryAutomationBoolean (Get-RecoveryAutomationValue -InputObject $startResult -Names @('RunnerInvoked', 'VendorProcessPossible'))
+        $launchAttempted = $runnerInvoked
+        # The runner may have started a vendor process that the module could not
+        # verify. That outcome is never an ordinary launch failure and never a
+        # plain 'not started' refusal: the attempt is made durably
+        # INTERRUPTED_UNKNOWN with its candidate identity retained, and the run
+        # stops there without authorizing a scan, a retry, or a close.
+        if ($startResult.Result -eq 'InterruptedUnknown' -or ($runnerInvoked -and $startResult.Started -ne $true)) {
+            return New-RecoveryAutomationInterruptedUnknownStateResult -State $state -Case $case `
+                -LaunchOutcome $startResult -LaunchAttempted $launchAttempted `
+                -Context ([pscustomobject]@{
+                    EventWriter = $eventWriter
+                    StateWriter = $stateWriter
+                    Clock       = $Clock
+                    ConfigurationResult = $configurationResult
+                    Runtime = $runtime
+                    Applications = $applications
+                    MediaTouched = $mediaTouched
+                })
+        }
         if (-not $startResult.Allowed -or -not $startResult.Started) {
+            # Every pre-launch refusal: the verified executable identity, the
+            # durable preconditions, and the launch authorization event were all
+            # refused before the runner ran, so no vendor process can exist. The
+            # case record is left in CLEAN state and no vendor action was taken.
+            $launchAttempted = $false
             $failureEvent = Write-RecoveryAutomationEvent -Writer $logHandle -State $state -EventType 'StageFailed' `
                 -Result 'Failed' -Stage 'LAUNCH' -ErrorDetail $startResult.ReasonCode
             return New-RecoveryAutomationResult -Success $false -ExitCode 7 -Mode 'FileScavenger' `
