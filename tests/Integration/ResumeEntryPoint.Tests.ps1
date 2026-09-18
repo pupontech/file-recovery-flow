@@ -237,7 +237,7 @@ BeforeAll {
 }
 
 Describe 'Resume entry point' {
-    It 'resumes a verified short recovery into the long scan without launching a vendor process' {
+    It 'does not claim a long scan after a resume when no vendor action was recorded' {
         $case = New-ResumeCase -StateName 'SHORT_RECOVERY_VERIFIED'
         $provider = New-ResumeDiskProvider
         $recorder = New-ResumeRunRecorder
@@ -251,19 +251,20 @@ Describe 'Resume entry point' {
 
         $result.Success | Should -BeFalse
         $result.Mode | Should -Be 'Resume'
-        $result.ReasonCode | Should -Be 'ManualGatePending'
-        $result.CurrentState | Should -Be 'LONG_SCAN_RUNNING'
+        # The long-scan hop requires an approved long-scan action. No such action
+        # was taken and the operator answered Stop, so the resume must refuse the
+        # hop by name instead of writing a running state and the evidence that
+        # belongs to an approval that never happened.
+        $result.ReasonCode | Should -Be 'ResumeNextStageNotAuthorized'
         $result.VendorLaunchAttempted | Should -BeFalse
         $recorder.Calls | Should -HaveCount 0
         $result.JobFolderPath | Should -Be $case.Folder
         $stateOnDisk = ([System.IO.File]::ReadAllText($case.Paths.StatePath, (New-Object System.Text.UTF8Encoding($false))) | ConvertFrom-Json)
-        $stateOnDisk.State | Should -Be 'LONG_SCAN_RUNNING'
-        $stateOnDisk.Stage | Should -Be 'LONG_SCAN'
-        $stateOnDisk.AttemptId | Should -Be ($case.Leaf + '-long-scan-001')
+        $stateOnDisk.State | Should -Be 'SHORT_RECOVERY_VERIFIED'
         $logText = [System.IO.File]::ReadAllText($case.Paths.LogPath, (New-Object System.Text.UTF8Encoding($false)))
-        # The routed stage is durably recorded as a new attempt for the long scan.
-        $logText | Should -Match '"State":"LONG_SCAN_RUNNING"'
-        $logText | Should -Match ($case.Leaf + '-long-scan-001')
+        # Nothing in the case record may claim a long scan was started.
+        $logText | Should -Not -Match 'LONG_SCAN_RUNNING'
+        $logText | Should -Not -Match 'LongScanApproved'
         # The verified short recovery stage is never rerun: its own evidence is
         # the one recorded before the resume.
         @([regex]::Matches($logText, 'RecoveryFinished')).Count | Should -Be 1

@@ -1810,9 +1810,14 @@ function New-RecoveryAutomationInterruptedUnknownStateResult {
                 ReasonCode  = [string]$LaunchOutcome.UnknownEvent.ReasonCode
             }) -Force
     }
+    # The guarded INTERRUPTED_UNKNOWN edge in modules/JobState.psm1 requires the
+    # caller to state, as a literal Boolean, that a launch attempt happened and its
+    # outcome is uncertain. Stating it here is exactly what the unknown record is:
+    # the run reached the process runner and cannot prove what happened, so no
+    # generic bypass is used and no evidence is invented.
     $transition = JobState\Set-RecoveryState -State $State -To 'INTERRUPTED_UNKNOWN' `
         -EventWriter $Context.EventWriter -StateWriter $Context.StateWriter `
-        -Context @{ EventType = 'StageInterruptedUnknown'; Result = 'NeedsReview'; Reason = 'VendorLaunchOutcomeUnknown'; Error = $ReasonCode } `
+        -Context @{ Evidence = 'LaunchAttemptUncertain'; LaunchAttemptUncertain = $true; EventType = 'StageInterruptedUnknown'; Result = 'NeedsReview'; Reason = 'VendorLaunchOutcomeUnknown'; Error = $ReasonCode } `
         -Clock $Context.Clock
     $unknownDurable = Test-RecoveryAutomationUnknownTransitionDurable -Transition $transition -StatePath $statePath
     if (-not $unknownDurable) {
@@ -1822,6 +1827,9 @@ function New-RecoveryAutomationInterruptedUnknownStateResult {
             $reason = [string]$transition.ReasonCode
         }
         $State | Add-Member -NotePropertyName LaunchOutcomeContract -NotePropertyValue $contract -Force
+        # The flag is always present so a caller can read the durability decision
+        # instead of inferring it from the reason code.
+        $State | Add-Member -NotePropertyName InterruptedUnknownDurable -NotePropertyValue $false -Force
         return New-RecoveryAutomationResult -Success $false -ExitCode 7 -Mode 'FileScavenger' `
             -ReasonCode $reason -Message $failureMessage `
             -ConfigurationResult $Context.ConfigurationResult -VendorLaunchAttempted $LaunchAttempted `
@@ -1878,7 +1886,7 @@ function New-RecoveryAutomationInterruptedUnknownHandoffResult {
         $State | Add-Member -NotePropertyName ProcessIdentity -NotePropertyValue $Handoff.ProcessIdentity -Force
     }
     $transition = JobState\Set-RecoveryState -State $State -To 'INTERRUPTED_UNKNOWN' -EventWriter $EventWriter `
-        -StateWriter $StateWriter -Context @{ EventType = 'StageInterruptedUnknown'; Result = 'NeedsReview'; Reason = 'HandoffOutcomeUnknown'; Error = $reason } `
+        -StateWriter $StateWriter -Context @{ Evidence = 'LaunchAttemptUncertain'; LaunchAttemptUncertain = $true; EventType = 'StageInterruptedUnknown'; Result = 'NeedsReview'; Reason = 'HandoffOutcomeUnknown'; Error = $reason } `
         -Clock $Clock
     $unknownDurable = Test-RecoveryAutomationUnknownTransitionDurable -Transition $transition -StatePath $statePath
     if (-not $unknownDurable) {
@@ -1898,6 +1906,7 @@ function New-RecoveryAutomationInterruptedUnknownHandoffResult {
                     }))
         }
         catch { }
+        $State | Add-Member -NotePropertyName InterruptedUnknownDurable -NotePropertyValue $false -Force
         return [pscustomobject]@{
             Allowed = $false
             Handoff = $Handoff
@@ -1910,6 +1919,7 @@ function New-RecoveryAutomationInterruptedUnknownHandoffResult {
             Preconditions = $Preconditions
         }
     }
+    $State | Add-Member -NotePropertyName InterruptedUnknownDurable -NotePropertyValue $true -Force
     return [pscustomobject]@{
         Allowed = $false
         Handoff = $Handoff

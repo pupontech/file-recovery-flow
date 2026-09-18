@@ -271,58 +271,8 @@ BeforeAll {
     $script:LifecycleAllowUnknownEdges = $false
     $script:LifecycleRealTransitionFunction = $null
 
-    function Install-LifecycleUnknownStateEdgeShim {
-        $module = Get-Module 'JobState'
-        # Dot-sourcing the scriptblock defines the shim IN the module scope; a
-        # plain '& $module { ... }' would define it in a throwaway child scope and
-        # Set-RecoveryState would keep calling the real function.
-        . $module {
-            if ($null -eq $script:LifecycleRealTransitionFunction) {
-                $script:LifecycleRealTransitionFunction = ${function:Test-RecoveryStateTransition}
-            }
-            $real = $script:LifecycleRealTransitionFunction
-            function Test-RecoveryStateTransition {
-                [CmdletBinding()]
-                param(
-                    [Parameter(Mandatory = $true)][AllowEmptyString()][string]$From,
-                    [Parameter(Mandatory = $true)][AllowEmptyString()][string]$To,
-                    [hashtable]$Context = $null
-                )
-
-                if ($env:LIFECYCLE_ALLOW_UNKNOWN_EDGE -eq '1' -and $To -eq 'INTERRUPTED_UNKNOWN') {
-                    return [pscustomobject]@{
-                        Allowed          = $true
-                        ReasonCode       = $null
-                        RequiredEvidence = $null
-                        RequiresDecision = $false
-                        From             = $From
-                        To               = $To
-                        Message          = $null
-                    }
-                }
-                return (& $real $From $To $Context)
-            }
-        }
-    }
-
-    function Enable-LifecycleUnknownStateEdges {
-        $env:LIFECYCLE_ALLOW_UNKNOWN_EDGE = '1'
-        Install-LifecycleUnknownStateEdgeShim
-        # Proves the shim is live in the module scope and that delegation still
-        # answers the real table for every edge that was not requested.
-        $module = Get-Module 'JobState'
-        $live = & $module {
-            $unknown = Test-RecoveryStateTransition -From 'CASE_READY' -To 'INTERRUPTED_UNKNOWN'
-            $real = Test-RecoveryStateTransition -From 'CASE_READY' -To 'LONG_SCAN_RUNNING'
-            @{ Unknown = $unknown.Allowed; RealDelegated = ($real.ReasonCode -eq 'IllegalTransition') }
-        }
-        if ($live.Unknown -ne $true -or $live.RealDelegated -ne $true) {
-            throw ('The unknown-state edge shim is not answering correctly: unknown=' + [string]$live.Unknown + ' delegated=' + [string]$live.RealDelegated)
-        }
-    }
 
     function Disable-LifecycleUnknownStateEdges {
-        $env:LIFECYCLE_ALLOW_UNKNOWN_EDGE = '0'
         $module = Get-Module 'JobState'
         . $module {
             if ($null -ne $script:LifecycleRealTransitionFunction) {
@@ -386,7 +336,6 @@ Describe 'RecoveryAutomation lifecycle outcome wiring' {
     }
 
     It 'records the canonical unknown launch state durably when the state module allows it' {
-        Enable-LifecycleUnknownStateEdges
         $fixture = New-FileScavengerEntrypointFixture
         Set-Content -LiteralPath $fixture.ConfigPath -Value '{"SchemaVersion":1,"WorkflowVersion":"1.0.0","ValidatedFileScavengerBuilds":[],"ValidatedRStudioBuilds":[],"CapacityReserveBytes":0}' -Encoding ASCII
         $runs = New-Object System.Collections.ArrayList
@@ -406,7 +355,10 @@ Describe 'RecoveryAutomation lifecycle outcome wiring' {
             -ElevationProvider { return $true } -FileScavengerProcessRunner $runner
 
         $result.Success | Should -BeFalse
-        $result.ReasonCode | Should -Be 'ProcessResultUnverified'
+        # The runner stated a failure, so the adapter names it RunnerReportedFailure;
+        # the run still records an unknown launch because the runner was invoked and
+        # a process may exist, which is the property under test here.
+        $result.ReasonCode | Should -Be 'RunnerReportedFailure'
         $result.CurrentState | Should -Be 'INTERRUPTED_UNKNOWN'
         $result.StateObject.InterruptedUnknownDurable | Should -BeTrue
         $result.StateObject.ProcessIdentity.Pid | Should -Be 7711
@@ -476,13 +428,21 @@ Describe 'RecoveryAutomation lifecycle outcome wiring' {
         $result.State.LaunchOutcome.Confidence | Should -Be 'Unknown'
         $result.State.ProcessIdentity.ProcessId | Should -Be 7722
         $runnerCalls | Should -HaveCount 1
-        $result.State.State | Should -Be 'READY_FOR_HANDOFF'
+        # The attempt is durably INTERRUPTED_UNKNOWN rather than left at the
+        # pre-launch state: the state module now allows that edge when the caller
+        # states the launch uncertainty.
+        $result.State.State | Should -Be 'INTERRUPTED_UNKNOWN'
+        $result.State.InterruptedUnknownDurable | Should -BeTrue
         @($events | Where-Object { $_.EventType -eq 'StageFailed' }) | Should -HaveCount 0
-        @($events | Where-Object { $_.EventType -eq 'RStudioLaunchOnlyHandoff' }) | Should -HaveCount 0
+        # The launch-only authorization event is written before the runner is
+        # invoked (that ordering is the contract); no event may claim the handoff
+        # landed in HANDOFF_MANUAL.
+        @($events | Where-Object { $_.EventType -eq 'RStudioLaunchOnlyHandoff' }) | Should -HaveCount 1
+        @($events | Where-Object { $_.State -eq 'HANDOFF_MANUAL' }) | Should -HaveCount 0
+        (Get-LifecycleStateOnDisk -StatePath $state.Paths.StatePath).State | Should -Be 'INTERRUPTED_UNKNOWN'
     }
 
     It 'records the unknown handoff state durably when the state module allows it' {
-        Enable-LifecycleUnknownStateEdges
         $state = New-LifecycleState
         $events = New-Object System.Collections.ArrayList
         $writer = New-LifecycleEventWriter -Events $events
@@ -511,7 +471,6 @@ Describe 'RecoveryAutomation lifecycle outcome wiring' {
     }
 
     It 'does not claim a durable handoff transition after a state persistence failure' {
-        Enable-LifecycleUnknownStateEdges
         $state = New-LifecycleState
         $events = New-Object System.Collections.ArrayList
         $writer = New-LifecycleEventWriter -Events $events
@@ -535,12 +494,53 @@ Describe 'RecoveryAutomation lifecycle outcome wiring' {
         $result.Launched | Should -BeFalse
         $result.State.HandoffTransitionVerification.Succeeded | Should -BeFalse
         $result.State.ProcessIdentity.ProcessId | Should -Be 7733
+        # This writer refuses every write, so even the unknown record cannot be made
+        # durable: the run must say so and must not claim a durable transition.
+        $result.State.InterruptedUnknownDurable | Should -BeFalse
+        # The refusal is named, the case keeps its previous state, and no event
+        # claims the handoff landed in HANDOFF_MANUAL.
+        $result.ReasonCode | Should -Be 'HandoffInterruptedUnknownNotDurable'
+        (Get-LifecycleStateOnDisk -StatePath $state.Paths.StatePath).State | Should -Be 'READY_FOR_HANDOFF'
+        # The unknown attempt is still recorded as an event; only the durable state
+        # transition could not land, and no event claims HANDOFF_MANUAL was reached.
+        @($events | Where-Object { $_.EventType -eq 'StageInterruptedUnknown' }) | Should -HaveCount 1
+        @($events | Where-Object { $_.State -eq 'HANDOFF_MANUAL' -and $_.EventType -ne 'RStudioLaunchOnlyHandoff' }) | Should -HaveCount 0
+    }
+
+    It 'records a durable unknown handoff when only the handoff snapshot fails' {
+        $state = New-LifecycleState
+        $events = New-Object System.Collections.ArrayList
+        $writer = New-LifecycleEventWriter -Events $events
+        # Only the HANDOFF_MANUAL snapshot is refused; the unknown record can still
+        # be written, which is the case a started vendor process must land in.
+        $stateWriter = @{ Write = {
+                param($request)
+                if ([string]$request.State.State -eq 'HANDOFF_MANUAL') {
+                    return [pscustomobject]@{ Success = $false; ReasonCode = 'FixtureStateWriteRefused'; Message = 'fixture refusal' }
+                }
+                [System.IO.File]::WriteAllText([string]$request.Path, ([string]$request.Text), (New-Object System.Text.UTF8Encoding($false)))
+                return [pscustomobject]@{ Success = $true; ReasonCode = $null; Message = $null }
+            } }
+        $executable = [pscustomobject]@{
+            Path = 'D:\Fixture\RStudio\application.exe'; Product = 'RStudio'; ProductName = 'R-Studio'
+            OriginalFilename = 'RStudio.exe'; FileVersion = '9.5.191810'; ProductVersion = '9.5'
+            CompanyName = 'R-Tools Technology, Inc.'; Publisher = 'R-Tools Technology, Inc.'
+            Exists = $true; Readable = $true; FileVersionInfoVerified = $true
+            EvidenceSource = 'FileVersionInfo'; IdentityStatus = 'Verified'
+        }
+        $runner = { param($request) return [pscustomobject]@{ Success = $true; ProcessId = 7744; Path = $request.ExecutablePath; StartTimeUtc = '2026-01-01T00:00:00Z'; HasExited = $false } }
+
+        $result = Invoke-RecoveryAutomationHandoff -State $state -Executable $executable `
+            -ProcessRunner $runner -EventWriter $writer -StateWriter $stateWriter
+
+        $result.Allowed | Should -BeFalse
+        $result.Launched | Should -BeFalse
+        $result.State.ProcessIdentity.ProcessId | Should -Be 7744
         $result.State.InterruptedUnknownDurable | Should -BeTrue
         (Get-LifecycleStateOnDisk -StatePath $state.Paths.StatePath).State | Should -Be 'INTERRUPTED_UNKNOWN'
-        # The failed HANDOFF_MANUAL snapshot is recorded as its own unknown event,
-        # never as a launched handoff.
         @($events | Where-Object { $_.EventType -eq 'StageInterruptedUnknown' }) | Should -HaveCount 1
-        @($events | Where-Object { $_.EventType -eq 'RStudioLaunchOnlyHandoff' }) | Should -HaveCount 0
+        # The refused HANDOFF_MANUAL snapshot is never reported as a landed handoff.
+        $result.State.HandoffTransitionVerification.Succeeded | Should -BeFalse
     }
 
     It 'resumes a verified short recovery without approving or claiming a long scan' {
@@ -659,20 +659,37 @@ Describe 'RecoveryAutomation lifecycle outcome wiring' {
     It 'requires the unknown launch edge to exist and to demand no evidence' {
         # The lifecycle fix needs a durable INTERRUPTED_UNKNOWN edge from every
         # state where a vendor launch is possible (the parent lane owns
-        # modules/JobState.psm1). Whether it exists today is asserted by the
-        # fail-safe tests above; what must hold either way is the shape: no
-        # evidence may be required, because requiring evidence would make the
-        # caller invent the very statement the unknown record exists to avoid.
+        # modules/JobState.psm1). The edge exists and is deliberately guarded: the
+        # caller must state, as a literal Boolean, that a launch attempt happened
+        # and its outcome is uncertain. An unguarded edge could be used as a generic
+        # bypass into INTERRUPTED_UNKNOWN, and no evidence is invented by the
+        # caller because the uncertainty is the fact being recorded.
         foreach ($from in @('SHORT_SCAN_RUNNING', 'CASE_READY', 'READY_FOR_HANDOFF')) {
-            $edge = Test-RecoveryStateTransition -From $from -To 'INTERRUPTED_UNKNOWN'
-            if ($edge.Allowed) {
-                $edge.RequiredEvidence | Should -BeNullOrEmpty
-                $edge.RequiresDecision | Should -BeFalse
+            $withoutContext = Test-RecoveryStateTransition -From $from -To 'INTERRUPTED_UNKNOWN'
+            if ($from -eq 'SHORT_SCAN_RUNNING') {
+                # A running attempt already carries the uncertainty: its edge stays
+                # open, exactly as it was before this round.
+                $withoutContext.Allowed | Should -BeTrue
+                $withoutContext.RequiresDecision | Should -BeFalse
             }
             else {
-                # An absent edge is reported as an illegal transition, never as a
-                # silently allowed one.
-                $edge.ReasonCode | Should -Be 'IllegalTransition'
+                $withoutContext.Allowed | Should -BeFalse
+                $withoutContext.ReasonCode | Should -Be 'LaunchAttemptUncertaintyNotStated'
+            }
+            $withContext = Test-RecoveryStateTransition -From $from -To 'INTERRUPTED_UNKNOWN' `
+                -Context @{ Evidence = 'LaunchAttemptUncertain'; LaunchAttemptUncertain = $true }
+            $withContext.Allowed | Should -BeTrue
+            $withContext.RequiresDecision | Should -BeFalse
+            # A string, a number, or a false flag is not the stated uncertainty.
+            # The running-state edge is unguarded, so this applies only to the
+            # edges that require the stated attempt.
+            if ($from -ne 'SHORT_SCAN_RUNNING') {
+                foreach ($notBoolean in @('true', 1, $false)) {
+                    $refused = Test-RecoveryStateTransition -From $from -To 'INTERRUPTED_UNKNOWN' `
+                        -Context @{ Evidence = 'LaunchAttemptUncertain'; LaunchAttemptUncertain = $notBoolean }
+                    $refused.Allowed | Should -BeFalse
+                    $refused.ReasonCode | Should -Be 'LaunchAttemptUncertaintyNotStated'
+                }
             }
         }
     }
