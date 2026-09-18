@@ -1,0 +1,315 @@
+# File Recovery Flow continuous integration.
+#
+# Contract: docs/IMPLEMENTATION-SPEC.md section 7, tests/TEST-MATRIX.md section 1,
+# and the W-05/W-06/W-07 static contracts in tests/Static.Tests.ps1.
+#
+# Boundaries this workflow never crosses:
+#   * The licensed recovery applications are never installed, downloaded, started,
+#     or simulated here. Their real behavior stays an owner-led live gate on a
+#     technician machine with a disposable case (docs/WORKFLOW.md).
+#   * Live test files and the LiveVendor/LiveElevation tags are excluded from every
+#     lane, and a test whose licensed product is absent reports Skip, never Pass.
+#   * No step writes outside the workspace or the runner temporary directory.
+#
+# Image pinning: windows-2022 and windows-2025 are pinned deliberately because the
+# project contract names both operating systems. The floating windows-latest label
+# is not used: it currently resolves to the 2025 image and would silently drop the
+# second documented platform.
+#
+# Shell pinning: every Windows PowerShell 5.1 step declares shell: powershell and
+# every PowerShell 7 step declares shell: pwsh, so an image default change cannot
+# move a step to a different engine.
+
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Pester is pinned by minimum version and asserted by major version in every
+  # lane. The pinned Windows images ship Pester 3.4.0 and 5.9.0 side by side, so
+  # selecting 5.x has to be explicit instead of accidental.
+  PESTER_MINIMUM_VERSION: '5.0.0'
+
+jobs:
+
+  static-linux:
+    name: static-linux - encoding, AST safety, launcher, CI contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Report the runner runtime
+        shell: pwsh
+        run: |
+          Write-Host "PowerShell : $($PSVersionTable.PSVersion)"
+          Write-Host "PSEdition  : $($PSVersionTable.PSEdition)"
+          Write-Host "OS         : $([System.Environment]::OSVersion.VersionString)"
+
+      - name: Resolve Pester 5.x
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $minimum = [version]$env:PESTER_MINIMUM_VERSION
+          $available = @(Get-Module -ListAvailable -Name Pester | Where-Object { $_.Version -ge $minimum })
+          if ($available.Count -eq 0) {
+            Write-Host "No Pester $minimum or newer is installed in this image; installing it into the user scope."
+            Install-Module -Name Pester -MinimumVersion $minimum -Scope CurrentUser -Force -SkipPublisherCheck -ErrorAction Stop
+          }
+          Import-Module -Name Pester -MinimumVersion $minimum -ErrorAction Stop
+          $resolved = Get-Module -Name Pester | Select-Object -First 1
+          Write-Host "Pester resolved: $($resolved.Version)"
+          if ($resolved.Version -lt $minimum) { throw "Pester $($resolved.Version) is older than the pinned minimum $minimum." }
+
+      - name: Static contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $config = & "$env:GITHUB_WORKSPACE/PesterConfiguration.ps1" -Lane Static
+          Write-Host "Lane paths   : $(@($config.Run.Path.Value) -join ', ')"
+          Write-Host "Excluded tags: $(@($config.Filter.ExcludeTag.Value) -join ', ')"
+          Invoke-Pester -Configuration $config
+
+      - name: Upload the Pester report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-static-linux
+          path: .test-results/
+          # .test-results is a hidden directory and actions/upload-artifact
+          # defaults to excluding hidden files, so every report was silently
+          # dropped and the repository had no artifact at all.
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+  test-windows:
+    name: test-windows - Windows PowerShell 5.1 contracts and launcher
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-2022
+          - windows-2025
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Assert the Windows PowerShell 5.1 runtime and the image build
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSVersion.Major -ne 5) {
+            throw "This lane must run Windows PowerShell 5.1, but found $($PSVersionTable.PSVersion)."
+          }
+          if ($PSVersionTable.PSEdition -ne 'Desktop') {
+            throw "This lane must run Windows PowerShell, but found the $($PSVersionTable.PSEdition) edition."
+          }
+          $operatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem
+          Write-Host "PSVersion : $($PSVersionTable.PSVersion)"
+          Write-Host "PSEdition : $($PSVersionTable.PSEdition)"
+          Write-Host "OS        : $($operatingSystem.Caption) $($operatingSystem.Version) build $($operatingSystem.BuildNumber)"
+          $coreVersion = & pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+          Write-Host "pwsh      : $coreVersion"
+
+      - name: Resolve the pinned Pester 5.x runtime
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $minimum = [version]$env:PESTER_MINIMUM_VERSION
+          $available = @(Get-Module -ListAvailable -Name Pester | Where-Object { $_.Version -ge $minimum } | Sort-Object -Property Version -Descending)
+          if ($available.Count -eq 0) {
+            Write-Host "No Pester $minimum or newer is installed in this image; installing it into the user scope."
+            Install-Module -Name Pester -MinimumVersion $minimum -Scope CurrentUser -Force -SkipPublisherCheck -ErrorAction Stop
+            $available = @(Get-Module -ListAvailable -Name Pester | Where-Object { $_.Version -ge $minimum } | Sort-Object -Property Version -Descending)
+          }
+          $selected = @($available)[0]
+          Import-Module -Name Pester -RequiredVersion $selected.Version -ErrorAction Stop
+          $resolved = Get-Module -Name Pester | Select-Object -First 1
+          $candidates = @($available) | ForEach-Object { $_.Version.ToString() }
+          Write-Host "Pester resolved: $($resolved.Version) from candidates $($candidates -join ', ')"
+          if ($resolved.Version.Major -ne 5) {
+            throw "This lane pins Pester 5.x, but $($resolved.Version) was selected."
+          }
+          if ($resolved.Version -lt $minimum) {
+            throw "Pester $($resolved.Version) is older than the pinned minimum $minimum."
+          }
+
+      - name: Unit, integration, and static contracts under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $config = & "$env:GITHUB_WORKSPACE\PesterConfiguration.ps1" -Lane All
+          # Pester exposes configuration entries as typed option objects, so the
+          # resolved value is read through .Value.
+          $excludedTags = @($config.Filter.ExcludeTag.Value)
+          foreach ($liveTag in @('LiveVendor', 'LiveElevation')) {
+            if ($excludedTags -notcontains $liveTag) {
+              throw "Lane All must exclude the live tag $liveTag."
+            }
+          }
+          Write-Host "Lane paths   : $(@($config.Run.Path.Value) -join ', ')"
+          Write-Host "Excluded tags: $($excludedTags -join ', ')"
+          Invoke-Pester -Configuration $config
+
+      - name: Launcher runs from another working directory
+        shell: cmd
+        timeout-minutes: 5
+        run: |
+          set "RECOVERY_NO_PAUSE=1"
+          cd /d "%RUNNER_TEMP%"
+          call "%GITHUB_WORKSPACE%\Start-Recovery.bat" -DryRun -NoPause
+          set "RECOVERY_LAUNCHER_CODE=%ERRORLEVEL%"
+          echo LAUNCHER_EXIT_CODE=%RECOVERY_LAUNCHER_CODE%
+          if not "%RECOVERY_LAUNCHER_CODE%"=="0" goto recovery_dry_run_failed
+          echo DRY_RUN_LAUNCHER_OK
+          exit /b 0
+          :recovery_dry_run_failed
+          echo ::error title=Launcher dry run::Start-Recovery.bat -DryRun -NoPause returned %RECOVERY_LAUNCHER_CODE% instead of 0.
+          exit /b 1
+
+      - name: Launcher propagates a failing entry point
+        shell: cmd
+        timeout-minutes: 5
+        run: |
+          set "RECOVERY_NO_PAUSE=1"
+          set "RECOVERY_COPY=%RUNNER_TEMP%\recovery-launcher-copy"
+          if not exist "%RECOVERY_COPY%" mkdir "%RECOVERY_COPY%"
+          copy /y "%GITHUB_WORKSPACE%\Start-Recovery.bat" "%RECOVERY_COPY%" > nul
+          cd /d "%RECOVERY_COPY%"
+          call Start-Recovery.bat -NoPause
+          set "RECOVERY_FAIL_CODE=%ERRORLEVEL%"
+          echo LAUNCHER_FAILING_ENTRYPOINT_EXIT_CODE=%RECOVERY_FAIL_CODE%
+          if not "%RECOVERY_FAIL_CODE%"=="0" goto recovery_launcher_pass
+          echo ::error title=Launcher exit code::Start-Recovery.bat returned 0 although its entry point is missing.
+          exit /b 1
+          :recovery_launcher_pass
+          exit /b 0
+
+      - name: Record the closing prompt behavior with redirected input
+        # First-run observation only. Every automated lane sets the explicit no-pause
+        # opt-out, so the launcher contract does not depend on this result: an
+        # interactive double-click remains an owner check. When the closing prompt
+        # does wait for a keypress here, this step ends by timeout and the job still
+        # reports its real test results.
+        shell: cmd
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          cd /d "%RUNNER_TEMP%\recovery-launcher-copy"
+          call Start-Recovery.bat < nul
+          echo PROMPT_OBSERVATION_EXIT_CODE=%ERRORLEVEL%
+
+      - name: Upload the Pester report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-${{ matrix.os }}
+          path: .test-results/
+          # See the static lane: hidden files are excluded by default.
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+  compat-analyze:
+    name: compat-analyze - PSScriptAnalyzer 5.1 compatibility
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Resolve PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $minimum = [version]'1.21.0'
+          $available = @(Get-Module -ListAvailable -Name PSScriptAnalyzer | Where-Object { $_.Version -ge $minimum })
+          if ($available.Count -eq 0) {
+            Write-Host "No PSScriptAnalyzer $minimum or newer is installed in this image; installing it into the user scope."
+            Install-Module -Name PSScriptAnalyzer -MinimumVersion $minimum -Scope CurrentUser -Force -SkipPublisherCheck -ErrorAction Stop
+          }
+          Import-Module -Name PSScriptAnalyzer -MinimumVersion $minimum -ErrorAction Stop
+          $resolved = Get-Module -Name PSScriptAnalyzer | Select-Object -First 1
+          Write-Host "PSScriptAnalyzer resolved: $($resolved.Version)"
+
+      - name: 5.1 syntax and command compatibility with findings as errors
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module -Name PSScriptAnalyzer -ErrorAction Stop
+          $analyzer = Get-Module -Name PSScriptAnalyzer | Select-Object -First 1
+          $profileFolder = Join-Path -Path $analyzer.ModuleBase -ChildPath 'compatibility_profiles'
+          if (-not (Test-Path -LiteralPath $profileFolder -PathType Container)) {
+            throw "The expected 5.1 compatibility profile folder was not found at $profileFolder."
+          }
+          # The bundled Windows PowerShell 5.1 desktop profiles are the documented
+          # command-availability source. When several are present the newest Windows
+          # build wins, and the chosen name is printed for the run record.
+          $profileNames = @(Get-ChildItem -LiteralPath $profileFolder -Filter '*5.1*.json' |
+            Where-Object { $_.Name -like '*_framework*' } |
+            Sort-Object -Property Name -Descending |
+            Select-Object -ExpandProperty BaseName)
+          if ($profileNames.Count -eq 0) {
+            throw "No bundled Windows PowerShell 5.1 desktop compatibility profile was found in $profileFolder."
+          }
+          $targetProfile = $profileNames[0]
+          Write-Host "5.1 target profile: $targetProfile"
+          $settings = @{
+            IncludeRules = @('PSUseCompatibleSyntax', 'PSUseCompatibleCommands')
+            Rules = @{
+              PSUseCompatibleSyntax   = @{ Enable = $true; TargetVersions = @('5.1') }
+              PSUseCompatibleCommands = @{ Enable = $true; TargetProfiles = @($targetProfile) }
+            }
+          }
+          # Two target sets, because command availability and syntax availability
+          # are different questions:
+          #
+          #   * Production files and PesterConfiguration.ps1 run under BOTH rules.
+          #     A cmdlet that Windows PowerShell 5.1 does not have is a real
+          #     defect there.
+          #   * The tests tree runs under PSUseCompatibleSyntax only. Pester's own
+          #     DSL (Should -Be, Context -Tag, ...) is not part of any Windows
+          #     PowerShell profile, so PSUseCompatibleCommands reported 1443
+          #     findings that all described the test framework, not this project.
+          #     The syntax rule still proves every test file parses on 5.1.
+          $allScriptFiles = @(Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File |
+            Where-Object { $_.Extension -in @('.ps1', '.psm1', '.psd1') } |
+            Where-Object { $_.FullName -notmatch '\\tests\\Live\\' } |
+            Where-Object { $_.FullName -notmatch '\\\.git\\' } |
+            Select-Object -ExpandProperty FullName)
+          $productionTargets = @($allScriptFiles | Where-Object { $_ -notmatch '\\tests\\' })
+          $testTargets = @($allScriptFiles | Where-Object { $_ -match '\\tests\\' })
+          Write-Host "Production files under syntax and command rules: $($productionTargets.Count)"
+          Write-Host "Test files under the syntax rule: $($testTargets.Count)"
+          $syntaxOnlySettings = @{
+            IncludeRules = @('PSUseCompatibleSyntax')
+            Rules = @{
+              PSUseCompatibleSyntax = @{ Enable = $true; TargetVersions = @('5.1') }
+            }
+          }
+          # Invoke-ScriptAnalyzer takes one path at a time in this module version, so
+          # each target list is analyzed file by file.
+          $findings = @()
+          foreach ($target in $productionTargets) {
+            $findings += @(Invoke-ScriptAnalyzer -Path $target -Settings $settings)
+          }
+          foreach ($target in $testTargets) {
+            $findings += @(Invoke-ScriptAnalyzer -Path $target -Settings $syntaxOnlySettings)
+          }
+          foreach ($finding in $findings) {
+            Write-Host "$($finding.RuleName) $($finding.ScriptPath):$($finding.Line) $($finding.Message)"
+          }
+          if ($findings.Count -gt 0) {
+            throw "$($findings.Count) PowerShell 5.1 compatibility finding(s); compatibility findings are errors in this lane."
+          }
+          Write-Host "No PowerShell 5.1 compatibility findings."
